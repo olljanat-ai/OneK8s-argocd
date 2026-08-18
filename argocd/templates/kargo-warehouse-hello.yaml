@@ -1,0 +1,58 @@
+{{- if and .Values.kargo.enabled .Values.apps.hello.enabled }}
+{{- $app := .Values.apps.hello }}
+# What a release of the hello application is made of.
+#
+# The Warehouse watches two things and freezes them together as one piece of
+# Freight: the image build, and the chart it is deployed with. Freight is
+# immutable — it names a tag and a commit, not "whatever main says" — which is
+# what makes a promotion a statement about a specific build rather than about a
+# moment in time. Promoting the same Freight twice deploys the same thing twice.
+#
+# Both subscriptions matter. With only the image, a chart change would reach
+# every stage the moment it merged, which is the hole the old delivery plane had
+# in a different shape: the gate would cover the application's code and not the
+# manifests that run it.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: hello
+  namespace: {{ .Values.kargo.project | quote }}
+  annotations:
+    kargo.akuity.io/description: >-
+      The hello application's image builds and the chart they are deployed
+      with, as Freight.
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+spec:
+  # How often Kargo looks, when no webhook has told it to look sooner.
+  interval: {{ $app.interval | quote }}
+  freightCreationPolicy: Automatic
+
+  subscriptions:
+    # The image the build workflow in the applications' repository pushes.
+    - image:
+        repoURL: {{ $app.image.repository | quote }}
+        # NewestBuild, not SemVer: these tags are content-addressed
+        # ("sha-<short>"), so there is no version to compare — Kargo reads each
+        # candidate's build timestamp instead. That costs a registry call per
+        # tag considered, which is what discoveryLimit bounds.
+        imageSelectionStrategy: NewestBuild
+        allowTagsRegexes:
+          - {{ $app.image.tagRegex | quote }}
+        discoveryLimit: {{ $app.image.discoveryLimit }}
+        # The pods pull by tag and the platform has no pull secret anywhere, so
+        # the package is public and this subscription needs no credentials.
+
+    # The chart, in the applications' repository. Restricted to the chart's own
+    # directory: a commit that only touches the application's source produces a
+    # new image (above) and no new chart revision, and a documentation change
+    # produces neither.
+    - git:
+        repoURL: {{ .Values.appsRepoURL | quote }}
+        branch: {{ .Values.appsTargetRevision | quote }}
+        commitSelectionStrategy: NewestFromBranch
+        includePaths:
+          - {{ $app.path | quote }}
+        discoveryLimit: {{ $app.image.discoveryLimit }}
+{{- end }}

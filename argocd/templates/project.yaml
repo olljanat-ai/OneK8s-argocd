@@ -15,8 +15,9 @@
 # belong in GitOps: an Application that tried to manage a Namespace would be
 # refused here rather than quietly fighting the tenants stack over it.
 #
-# It says nothing about *when* an Application is applied — that is the stage's
-# sync policy (applicationset-hello.yaml), not the project's business.
+# It says nothing about *what* an Application deploys or *when* — both
+# Applications here are auto-synced, and which revision each one runs is
+# decided upstream of Argo CD by Kargo (kargo-stages-hello.yaml).
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:

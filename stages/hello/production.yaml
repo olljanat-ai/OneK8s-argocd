@@ -1,0 +1,20 @@
+# What the hello application's PRODUCTION stage runs, on AWS/EKS.
+#
+# Written by Kargo. Every line below is the output of a promotion — do not edit
+# this file by hand: the next promotion overwrites it, and an edit here would
+# deploy something no Freight names.
+#
+# Two consumers read it, both in argocd/templates/applicationset-hello.yaml:
+#
+#   chartRevision  the ApplicationSet's git generator, as the chart source's
+#                  targetRevision
+#   image.tag      Argo CD, as a Helm values file for that chart
+#
+# The values below are the seed a fresh environment starts from: the branch,
+# and no image at all. Argo CD fails the first sync loudly ("image.tag is
+# required") until the first promotion has run, which is the honest state — an
+# environment whose Warehouse has not produced Freight yet has nothing to
+# deploy.
+chartRevision: main
+image:
+  tag: ""

@@ -1,17 +1,18 @@
 # OneK8s-argocd
 
-**What Argo CD runs, as Argo CD objects.** This repository is the OneK8s
-delivery plane: one Helm chart (`argocd/`) holding the platform `AppProject` and
-the `ApplicationSet`s that release the platform's applications to the clusters
-the [OneK8s](https://github.com/olljanat-ai/OneK8s) platform builds.
+**The delivery plane, as objects.** This repository decides *where* and *when*
+the platform's applications are deployed: one Helm chart (`argocd/`) holding the
+Argo CD `AppProject` and `ApplicationSet`s, and the [Kargo](https://kargo.io)
+`Project`, `Warehouse` and `Stage`s that decide which build each of those
+Applications runs.
 
 It holds no application source, no chart of an application and no Terraform.
 Three repositories, three jobs:
 
 | Repository | Owns |
 |---|---|
-| [OneK8s](https://github.com/olljanat-ai/OneK8s) | The clusters and the platform: foundations, tenants, the Argo CD hub, and the one root `Application` that points Argo CD here. |
-| **OneK8s-argocd** (this one) | Where and when an application is deployed: the `AppProject`, the `ApplicationSet`s, the release stages and the gate in front of production. |
+| [OneK8s](https://github.com/olljanat-ai/OneK8s) | The clusters and the platform: foundations, tenants, the Argo CD hub, Kargo, and the one root `Application` that points them here. |
+| **OneK8s-argocd** (this one) | Where and when an application is deployed: the `AppProject`, the `ApplicationSet`s, the release path and the gate in front of production. |
 | [OneK8s-hello](https://github.com/olljanat-ai/OneK8s-hello) | What is deployed: the example applications, their source, their Dockerfiles and their charts. |
 
 The split is the point. A developer changing `apps/hello/chart` in OneK8s-hello
@@ -20,43 +21,53 @@ an image; and the platform repository owns neither — it only says which
 repository, revision and environment the delivery plane is bootstrapped from.
 
 ```
-OneK8s                          this repository                OneK8s-hello
-──────                          ───────────────                ────────────
+OneK8s                     this repository                      OneK8s-hello
+──────                     ───────────────                      ────────────
 gitops/root-app.tf
-  └── Application ──── syncs ──▶ argocd/  (Helm chart)
-      platform-gitops             ├── AppProject onek8s-platform
-      (values: environment,       ├── ApplicationSet hello-staging ────┐
-       repos, revisions,          ├── ApplicationSet hello-production ─┤ syncs
-       domain, tenant, sql)       └── ApplicationSet db-hello ─────────┘ apps/*/chart
+  └── Application ─ syncs ─▶ argocd/  (Helm chart)
+      platform-gitops        ├── AppProject onek8s-platform
+      (values: environment,  ├── Kargo Project onek8s-hello
+       repos, revisions,     │     ├── Warehouse hello ──── watches ──▶ image + chart
+       domain, tenant,       │     ├── Stage staging    ┐
+       sql, kargo)           │     └── Stage production ┘ write stages/hello/*.yaml
+                             ├── ApplicationSet hello-staging ────┐
+                             ├── ApplicationSet hello-production ─┤ sync apps/*/chart
+                             └── ApplicationSet db-hello ─────────┘ at the promoted revision
 ```
 
 ## The release path
 
 `hello` is deployed twice, to two clouds that mean two different things:
 
-| Stage | Cloud | Cluster | Sync | URL |
+| Stage | Cloud | Cluster | How it gets there | URL |
 |---|---|---|---|---|
-| `staging` | `azure` | AKS — the Argo CD hub, `in-cluster` | automated (prune + selfHeal) | `https://azure-hello.<domain>` |
-| `production` | `aws` | EKS — a registered spoke | **manual**: a human promotes | `https://aws-hello.<domain>` |
+| `staging` | `azure` | AKS — the Argo CD hub, `in-cluster` | Kargo promotes every new build automatically | `https://azure-hello.<domain>` |
+| `production` | `aws` | EKS — a registered spoke | **a person promotes it, and only from `staging`** | `https://aws-hello.<domain>` |
 
-`db-hello` has no stages: its database is an Azure resource and its identity is
-an Entra one, so it is deployed to Azure and nowhere else, and only when the
-Azure foundation of that environment was applied with `enable_sql = true`.
+`db-hello` has no stages and no Kargo objects: its database is an Azure resource
+and its identity is an Entra one, so it is deployed to Azure and nowhere else,
+and only when the Azure foundation of that environment was applied with
+`enable_sql = true`. An application with one cluster has no release *path*.
 
 Stages are configuration, not template logic — `argocd/values.yaml`:
 
 ```yaml
 apps:
   hello:
+    image:
+      repository: ghcr.io/olljanat-ai/onek8s-hello/hello
+      tagRegex: ^sha-[0-9a-f]{7,40}$   # immutable build tags only
     stages:
       staging:
         cloud: azure
         cluster: in-cluster    # the hub: named, because it has no cluster Secret
-        autoSync: true
+        promotedFrom: ""       # the Warehouse: new builds enter here
+        autoPromotion: true
       production:
         cloud: aws             # a spoke: matched by label on the Secret gitops wrote
-        autoSync: false        # the gate
-        targetRevision: ""     # empty = the same revision staging tracks
+        promotedFrom: staging  # only what staging has already run
+        autoPromotion: false   # the gate
+        soakTime: ""           # e.g. "2h": how long it must have run in staging first
 ```
 
 A stage that names a `cluster` is generated from a one-element list (that is how
@@ -64,52 +75,117 @@ the hub gets in — Argo CD's built-in `in-cluster` entry carries no Secret and 
 cannot be selected by label). A stage that names only a `cloud` is generated by a
 cluster generator matching `onek8s.io/cloud` and `onek8s.io/environment` on the
 spokes' cluster Secrets, so a cloud that is not registered as a spoke in this
-environment produces no `Application` at all — nothing to keep in sync between
-the two.
+environment produces no `Application` at all.
 
-## The approval gate in front of AWS
+## How a promotion works
 
-Production carries **no `syncPolicy.automated`**. Argo CD still tracks the
-Application — it turns `OutOfSync` the moment the chart or the image moves in
-staging — but it applies nothing until a human syncs it:
+Kargo's `Warehouse` watches two things — the image the build workflow pushes and
+the chart it is deployed with — and freezes them together as a piece of
+**Freight**. Freight is immutable: it names a tag and a commit, never "whatever
+`main` says". Promoting a stage runs the steps in
+`argocd/templates/kargo-stages-hello.yaml`, which write that Freight into this
+repository:
 
-```bash
-argocd app get hello-production --grpc-web       # what would change
-argocd app sync hello-production --grpc-web      # open the gate
+```
+ghcr.io/…/hello:sha-a1b2c3d ─┐
+                             ├─▶ Freight ──▶ Stage staging ──▶ commit:
+apps/hello/chart @ 9f4e2b1 ──┘                                 stages/hello/staging.yaml
+                                                                 chartRevision: 9f4e2b1
+                                                                 image.tag: sha-a1b2c3d
+                                    │
+                              a person promotes
+                                    ▼
+                                Stage production ──▶ commit:
+                                                     stages/hello/production.yaml
 ```
 
-Two things make that hard to lose by accident:
+Both `ApplicationSet`s read those files back — `chartRevision` as the chart
+source's `targetRevision`, `image.tag` as a Helm values file — so **what a
+cluster runs is a line in Git**, and getting there means making a commit.
 
-- **CI asserts it.** `PR Validation` renders the chart and compares every
-  stage's `autoSync` against the rendered `syncPolicy`, and fails if a stage
-  that should be manual came out automated — or if no manual stage is left at
-  all.
-- **The recorded path is a protected workflow.** `Promote to production`
-  (`.github/workflows/promote-production.yml`) prints the diff first, then binds
-  the syncing job to the GitHub environment `production`. With required
-  reviewers configured on that environment, the run waits for a named human, and
-  the approval, the diff and the sync end up in one run log.
+That is also why both Applications are auto-synced now. The gate in front of AWS
+is no longer "Argo CD has been told not to apply this": it is that no commit says
+production runs that build yet. Three properties follow, none of which the old
+withheld-sync gate had:
 
-Neither replaces the other: the workflow is the audited path, the missing
-`automated` block is the guarantee.
+- It cannot be lifted by editing the delivery plane. Adding a sync policy back
+  changes nothing, because the Application is already synced — to the previous
+  Freight.
+- It covers the chart as well as the image. A chart change is part of the
+  Freight, so it reaches production by promotion like everything else.
+- It leaves a record where the change is: `git log stages/hello/production.yaml`
+  names every build production has ever run, the Freight it came from and the
+  person who asked for it.
 
-### Setting up the workflow
+## Promoting
 
-1. **Settings → Environments → `production`** — add the people or teams allowed
-   to promote as *required reviewers*.
-2. `vars.ARGOCD_SERVER` — the hub's host, e.g. `argocd.onek8s.lol`.
-3. `secrets.ARGOCD_AUTH_TOKEN` — a token for the `ci` account. The account
-   itself is part of the hub: OneK8s' `foundations/azure` declares it
-   token-only, bound to `role:ci`, which may read every application and sync
-   the ones in this chart's `onek8s-platform` project. Only its token is
-   manual, and only an Argo CD admin can mint one:
+Whatever opens the gate leaves the same commit behind, so use whichever is at
+hand:
+
+```bash
+# The UI: Project onek8s-hello, Stage production, "Promote" on the Freight
+open https://kargo.onek8s.lol
+
+# The CLI
+kargo login https://kargo.onek8s.lol --sso
+kargo get freight --project onek8s-hello            # what staging has run
+kargo promote   --project onek8s-hello --stage production --freight <name>
+kargo get promotions --project onek8s-hello         # who promoted what, when
+
+# No CLI, no UI: a Promotion is an ordinary object
+kubectl -n onek8s-hello get stage staging -o jsonpath='{.status.freightHistory[0].items.*.name}'
+```
+
+Who may do it is `kargo.promoters` in `argocd/values.yaml`: a list of Entra ID
+group object IDs, rendered into a `ServiceAccount` and a `Role` in the Project's
+namespace that grant `promote` on exactly the stages that wait for a person.
+That list lives here, beside the Stage it guards, so changing the guest list is a
+reviewed commit rather than a `terraform apply` — and it grants nothing else:
+not editing a Stage, not changing what the Warehouse watches, not promoting in
+another Project.
+
+Two things make the gate hard to lose by accident:
+
+- **CI asserts it.** `PR Validation` renders the chart and compares three
+  objects against `apps.hello.stages` — the `ProjectConfig`'s promotion policy,
+  the `Stage`'s Freight sources, and the `ApplicationSet`'s Kargo authorization
+  — and fails if any of them drifts, if no stage waits for a person, or if the
+  one that does could take an unproven build straight from the Warehouse.
+- **The file a promotion writes is the file Argo CD reads**, and CI checks that
+  those two references still name the same path. A rename that updated only one
+  of them would leave a stage frozen on whatever it last deployed, silently.
+
+## What the hub has to have
+
+Kargo runs on the hub and is installed by OneK8s' `foundations/azure/kargo.tf`
+(`enable_kargo`). Two things are deliberately not installed with it, because
+they are credentials rather than configuration:
+
+1. **A Git credential that may push to this repository.** A promotion is a
+   commit, so Kargo needs one. Create it in the Project's namespace, or in the
+   cluster's shared-credentials namespace to serve every Project:
 
    ```bash
-   argocd login "$ARGOCD_SERVER" --grpc-web --sso
-   argocd account generate-token --account ci --grpc-web --expires-in 90d
+   kubectl -n kargo-shared-resources create secret generic onek8s-argocd-repo \
+     --from-literal=repoURL=https://github.com/olljanat-ai/OneK8s-argocd.git \
+     --from-literal=username=<user or app-id> \
+     --from-literal=password=<PAT or installation token>
+   kubectl -n kargo-shared-resources label secret onek8s-argocd-repo \
+     kargo.akuity.io/cred-type=git
    ```
 
-Without those, promotion is the Argo CD UI or the CLI — the gate is unaffected.
+   A fine-grained PAT with *contents: read and write* on this repository alone is
+   enough; a GitHub App installation is the better long-lived answer.
+
+2. **A webhook secret**, if you want a push to be noticed immediately instead of
+   on the Warehouse's `interval` (5 minutes). Set `kargo.webhook.enabled=true`,
+   create the named Secret in the Project's namespace, and point a GitHub webhook
+   at the receiver's URL (`kubectl -n onek8s-hello get projectconfig onek8s-hello
+   -o jsonpath='{.status.webhookReceivers}'`).
+
+Nothing else is manual. There is no Argo CD API account and no bearer token
+anywhere in the promotion path any more: Kargo writes `Application` objects as a
+controller, through the Kubernetes API, under RBAC the chart installs.
 
 ## What Terraform passes in
 
@@ -126,6 +202,7 @@ OneK8s' `gitops/root-app.tf` creates one `Application` on the hub pointing at
 | `domain` | the platform wildcard, `var.platform_apps.domain` |
 | `tenant` | the namespace the tenants stack created |
 | `sql.server`, `sql.database` | the Azure foundation's outputs — empty means no `db-hello` |
+| `kargo.enabled`, `kargo.namespace`, `kargo.url` | the hub foundation's outputs — `enabled` is false when the hub has no Kargo, and then no promotion object is rendered at all |
 
 That is what lets one copy of this chart serve `prototype`, `dev`, `staging` and
 `prod`: nothing environment-specific is committed here.
@@ -144,13 +221,20 @@ helm template platform-gitops argocd | less
 helm template platform-gitops argocd \
   --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
   --set sql.database=appdb
+
+# as a hub without Kargo renders it: Argo CD objects, no promotion objects
+helm template platform-gitops argocd --set kargo.enabled=false
 ```
 
 Nothing here is applied by hand: merging to `main` is what deploys it, because
 the root Application syncs this repository. Adding an application is a new
-`templates/applicationset-<app>.yaml` plus its entry under `apps:` — and its
-repository must be listed in the `AppProject`'s `sourceRepos`, which is the two
-values `repoURL` and `appsRepoURL` today.
+`templates/applicationset-<app>.yaml` plus its entry under `apps:` — and, if it
+has more than one cluster to travel between, a `Warehouse` and its `Stage`s.
+Its repository must be listed in the `AppProject`'s `sourceRepos`, which is the
+two values `repoURL` and `appsRepoURL` today.
+
+`stages/` is the exception: it is written by Kargo, and editing it by hand
+deploys something no Freight names. The next promotion overwrites it.
 
 ## Boundaries the AppProject enforces
 
@@ -161,3 +245,7 @@ platform's convention that tenant onboarding — namespaces, quotas,
 SecretStores — stays in Terraform and only workloads belong in GitOps: an
 Application that tried to manage a `Namespace` is refused by Argo CD rather than
 quietly fighting the tenants stack over it.
+
+The Kargo objects are not in that project: they are brought in by the root
+Application itself, which is in `default`, because a Kargo `Project` is
+cluster-scoped and creates the namespace its `Stage`s live in.

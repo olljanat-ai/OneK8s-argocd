@@ -1,11 +1,12 @@
 apiVersion: v2
 name: onek8s-argocd
 description: >-
-  Everything Argo CD runs, as Argo CD objects: the platform AppProject and the
-  ApplicationSets that release the platform's applications along their stages —
-  Azure for staging, AWS for production, with a manual gate in front of the
-  latter. The root Application that OneK8s' gitops/root-app.tf creates is the
-  only piece of this that Terraform owns; from here down the delivery plane is
-  Git.
+  The delivery plane, as objects: the platform AppProject and the
+  ApplicationSets Argo CD syncs, and the Kargo Project, Warehouse and Stages
+  that decide what each of those Applications runs — Azure for staging, AWS for
+  production, with the gate in front of the latter being a promotion nobody has
+  made rather than a sync nobody has pressed. The root Application that OneK8s'
+  gitops/root-app.tf creates is the only piece of this that Terraform owns; from
+  here down the delivery plane is Git.
 type: application
-version: 0.2.0
+version: 0.3.0

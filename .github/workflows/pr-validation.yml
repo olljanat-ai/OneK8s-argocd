@@ -75,19 +75,22 @@ jobs:
       # is the file that is meant to be edited.
       - name: Every stage promotes the way values.yaml says it does
         run: |
-          helm template platform-gitops argocd > /tmp/rendered.yaml
+          helm template platform-gitops argocd \
+            --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
+            --set sql.database=appdb > /tmp/rendered.yaml
           python3 - <<'PY'
           import sys, yaml
 
           values = yaml.safe_load(open("argocd/values.yaml"))
-          stages = values["apps"]["hello"]["stages"]
-          project = values["kargo"]["project"]
-          stages_path = values["kargo"]["stagesPath"]
+          kargo = values["kargo"]
+          stages_path = kargo["stagesPath"]
+          prefix = kargo["projectPrefix"]
 
           docs = [d for d in yaml.safe_load_all(open("/tmp/rendered.yaml")) if d]
           by_kind = {}
           for doc in docs:
-              by_kind.setdefault(doc["kind"], {})[doc["metadata"]["name"]] = doc
+              key = (doc["metadata"].get("namespace"), doc["metadata"]["name"])
+              by_kind.setdefault(doc["kind"], {})[key] = doc
 
           status = 0
 
@@ -96,131 +99,235 @@ jobs:
               print(f"::error file={where}::{message}")
               status = 1
 
-          project_config = by_kind.get("ProjectConfig", {}).get(project)
-          policies = {}
-          if project_config is None:
-              error("argocd/templates/kargo-project.yaml",
-                    f"no ProjectConfig {project} was rendered — nothing states which "
-                    "stages Kargo may promote by itself.")
-          else:
-              policies = {
-                  policy["stage"]: bool(policy.get("autoPromotionEnabled"))
-                  for policy in project_config["spec"]["promotionPolicies"]
-              }
+          def find(kind, name, namespace=None):
+              return by_kind.get(kind, {}).get((namespace, name))
 
-          for stage, cfg in stages.items():
-              wanted = bool(cfg.get("autoPromotion"))
-              upstream = cfg.get("promotedFrom") or None
-              print(f"{stage:12} autoPromotion={wanted!s:5} promotedFrom={upstream or '(warehouse)':12} "
-                    f"cloud={cfg.get('cloud')}")
+          # Every application that travels a release path, not a hard-coded
+          # one: the whole point of the chart being generic is that adding an
+          # application must not mean remembering to add it here too.
+          promoted = {
+              name: app for name, app in values["apps"].items()
+              if app.get("enabled") and app.get("release")
+          }
+          if not promoted:
+              error("argocd/values.yaml", "No application has a release path any more.")
 
-              # 1. The promotion policy.
-              if stage not in policies:
-                  error("argocd/templates/kargo-project.yaml",
-                        f"the ProjectConfig has no promotion policy for stage {stage}.")
-              elif policies[stage] != wanted:
-                  error("argocd/templates/kargo-project.yaml",
-                        f"stage {stage} renders autoPromotionEnabled={policies[stage]}, but "
-                        f"values.yaml says autoPromotion={wanted}. A stage with "
-                        "autoPromotion=false must stay manual: that is the gate in front "
-                        "of production.")
+          task_name = kargo["promotionTask"]
+          if find("ClusterPromotionTask", task_name) is None:
+              error("argocd/templates/kargo-promotion-task.yaml",
+                    f"no ClusterPromotionTask {task_name} was rendered — every Stage "
+                    "references it, so nothing could be promoted.")
 
-              # 2. Where the Freight comes from.
-              kargo_stage = by_kind.get("Stage", {}).get(stage)
-              if kargo_stage is None:
-                  error("argocd/templates/kargo-stages-hello.yaml",
-                        f"stage {stage} renders no Kargo Stage.")
-                  continue
-              sources = kargo_stage["spec"]["requestedFreight"][0]["sources"]
-              if upstream:
-                  if sources.get("direct"):
-                      error("argocd/templates/kargo-stages-hello.yaml",
-                            f"stage {stage} takes Freight directly from the Warehouse, but "
-                            f"values.yaml says it is promoted from {upstream}. A build that "
-                            "has not run upstream must not be promotable here.")
-                  if sources.get("stages") != [upstream]:
-                      error("argocd/templates/kargo-stages-hello.yaml",
-                            f"stage {stage} draws Freight from {sources.get('stages')}, but "
-                            f"values.yaml says {upstream}.")
-              elif not sources.get("direct"):
-                  error("argocd/templates/kargo-stages-hello.yaml",
-                        f"stage {stage} has no upstream stage and does not take Freight "
-                        "directly from the Warehouse, so nothing can ever be promoted to it.")
+          for app_name, app in promoted.items():
+              project = f"{prefix}-{app_name}"
+              print(f"\n=== {app_name} ({project})")
 
-              # 3. The Application, and what may sync it.
-              appset = by_kind.get("ApplicationSet", {}).get(f"hello-{stage}")
-              if appset is None:
-                  error("argocd/templates/applicationset-hello.yaml",
-                        f"stage {stage} renders no ApplicationSet hello-{stage}.")
-                  continue
-              template = appset["spec"]["template"]
-              authorized = template["metadata"].get("annotations", {}).get(
-                  "kargo.akuity.io/authorized-stage")
-              if authorized != f"{project}:{stage}":
-                  error("argocd/templates/applicationset-hello.yaml",
-                        f"hello-{stage} is authorized for {authorized!r}, expected "
-                        f"'{project}:{stage}'. Kargo refuses to sync an Application that has "
-                        "not named the Stage acting on it, and a wrong name here lets one "
-                        "stage sync another's cluster.")
-              if "automated" not in template["spec"]["syncPolicy"]:
-                  error("argocd/templates/applicationset-hello.yaml",
-                        f"hello-{stage} carries no syncPolicy.automated. With Kargo in front, "
-                        "the gate is the promotion, not a withheld sync — an un-automated "
-                        "Application would silently stop tracking what was promoted.")
-
-              # 4. The file a promotion writes is the file Argo CD reads. These
-              #    are two independent references to one path, in two objects,
-              #    and a rename that updates only one of them would leave the
-              #    stage frozen on whatever it last deployed.
-              stage_file = f"{stages_path}/hello/{stage}.yaml"
-              chart_source = template["spec"]["sources"][0]
-              if f"$values/{stage_file}" not in chart_source["helm"]["valueFiles"]:
-                  error("argocd/templates/applicationset-hello.yaml",
-                        f"hello-{stage} does not read {stage_file}, so a promotion would not "
-                        "change what it deploys.")
-              written = [
-                  step["config"]["path"]
-                  for step in kargo_stage["spec"]["promotionTemplate"]["spec"]["steps"]
-                  if step["uses"] == "yaml-update"
-              ]
-              if written != [f"./repo/{stage_file}"]:
-                  error("argocd/templates/kargo-stages-hello.yaml",
-                        f"stage {stage} writes {written}, but hello-{stage} reads "
-                        f"{stage_file}.")
-
-              try:
-                  promoted = yaml.safe_load(open(stage_file))
-              except FileNotFoundError:
-                  error(stage_file, f"{stage_file} is missing. The ApplicationSet's generator "
-                                    "reads it, so without it the stage produces no Application "
-                                    "at all.")
+              project_config = find("ProjectConfig", project, project)
+              policies = {}
+              if project_config is None:
+                  error("argocd/templates/kargo-projects.yaml",
+                        f"no ProjectConfig {project} was rendered — nothing states which "
+                        f"stages of {app_name} Kargo may promote by itself.")
               else:
-                  for key in ("chartRevision", "image"):
-                      if key not in promoted:
-                          error(stage_file, f"{stage_file} has no {key!r}: it is what "
-                                            "the generator and the chart read back.")
+                  policies = {
+                      policy["stage"]: bool(policy.get("autoPromotionEnabled"))
+                      for policy in project_config["spec"]["promotionPolicies"]
+                  }
 
-          # The two halves of the promise, stated once about the release path as a
-          # whole rather than per stage: somebody has to promote, and what they
-          # promote has to have run somewhere first. A change that keeps every
-          # object internally consistent can still delete the release path by
-          # rewriting values.yaml, which is what these catch.
-          gated = {name: cfg for name, cfg in stages.items() if not cfg.get("autoPromotion")}
-          if not gated:
-              error("argocd/values.yaml", "No stage requires a person to promote it any "
-                                          "more. At least one — production on AWS — must.")
-          elif not any(cfg.get("promotedFrom") for cfg in gated.values()):
-              error("argocd/values.yaml", "No stage both waits for a person and draws its "
-                                          "Freight from another stage. Production may only "
-                                          "run what staging has already run; taking Freight "
-                                          "straight from the Warehouse would let an "
-                                          "unproven build be promoted to AWS.")
+              for stage, cfg in app["stages"].items():
+                  wanted = bool(cfg.get("autoPromotion"))
+                  upstream = cfg.get("promotedFrom") or None
+                  print(f"  {stage:12} autoPromotion={wanted!s:5} "
+                        f"promotedFrom={upstream or '(warehouse)':12} cloud={cfg.get('cloud')}")
 
-          for name, cfg in stages.items():
-              upstream = cfg.get("promotedFrom")
-              if upstream and upstream not in stages:
-                  error("argocd/values.yaml", f"stage {name} is promoted from {upstream!r}, "
-                                              "which is not a stage of this application.")
+                  # 1. The promotion policy.
+                  if stage not in policies:
+                      error("argocd/templates/kargo-projects.yaml",
+                            f"{project} has no promotion policy for stage {stage}.")
+                  elif policies[stage] != wanted:
+                      error("argocd/templates/kargo-projects.yaml",
+                            f"{app_name}/{stage} renders autoPromotionEnabled="
+                            f"{policies[stage]}, but values.yaml says autoPromotion="
+                            f"{wanted}. A stage with autoPromotion=false must stay manual: "
+                            "that is the gate in front of production.")
+
+                  # 2. Where the Freight comes from.
+                  kargo_stage = find("Stage", stage, project)
+                  if kargo_stage is None:
+                      error("argocd/templates/kargo-stages.yaml",
+                            f"{app_name}/{stage} renders no Kargo Stage.")
+                      continue
+                  sources = kargo_stage["spec"]["requestedFreight"][0]["sources"]
+                  if upstream:
+                      if sources.get("direct"):
+                          error("argocd/templates/kargo-stages.yaml",
+                                f"{app_name}/{stage} takes Freight directly from the "
+                                f"Warehouse, but values.yaml says it is promoted from "
+                                f"{upstream}. A build that has not run upstream must not "
+                                "be promotable here.")
+                      if sources.get("stages") != [upstream]:
+                          error("argocd/templates/kargo-stages.yaml",
+                                f"{app_name}/{stage} draws Freight from "
+                                f"{sources.get('stages')}, but values.yaml says {upstream}.")
+                  elif not sources.get("direct"):
+                      error("argocd/templates/kargo-stages.yaml",
+                            f"{app_name}/{stage} has no upstream stage and does not take "
+                            "Freight directly from the Warehouse, so nothing can ever be "
+                            "promoted to it.")
+
+                  # 3. The Application, and what may sync it.
+                  appset = find("ApplicationSet", f"{app_name}-{stage}", "argocd")
+                  if appset is None:
+                      error("argocd/templates/applicationsets.yaml",
+                            f"{app_name}/{stage} renders no ApplicationSet.")
+                      continue
+                  template = appset["spec"]["template"]
+                  authorized = template["metadata"].get("annotations", {}).get(
+                      "kargo.akuity.io/authorized-stage")
+                  if authorized != f"{project}:{stage}":
+                      error("argocd/templates/applicationsets.yaml",
+                            f"{app_name}-{stage} is authorized for {authorized!r}, expected "
+                            f"'{project}:{stage}'. Kargo refuses to sync an Application that "
+                            "has not named the Stage acting on it, and a wrong name here "
+                            "lets one stage sync another's cluster.")
+                  if "automated" not in template["spec"]["syncPolicy"]:
+                      error("argocd/templates/applicationsets.yaml",
+                            f"{app_name}-{stage} carries no syncPolicy.automated. With Kargo "
+                            "in front, the gate is the promotion, not a withheld sync — an "
+                            "un-automated Application would silently stop tracking what was "
+                            "promoted.")
+
+                  # 4. The file a promotion writes is the file Argo CD reads.
+                  #    Two independent references to one path, in two objects; a
+                  #    rename that updated only one would leave the stage frozen
+                  #    on whatever it last deployed.
+                  stage_file = f"{stages_path}/{app_name}/{stage}.yaml"
+                  chart_source = template["spec"]["sources"][0]
+                  if f"$values/{stage_file}" not in chart_source["helm"].get("valueFiles", []):
+                      error("argocd/templates/applicationsets.yaml",
+                            f"{app_name}-{stage} does not read {stage_file}, so a promotion "
+                            "would not change what it deploys.")
+                  promo_vars = {
+                      v["name"]: v.get("value")
+                      for v in kargo_stage["spec"]["promotionTemplate"]["spec"]["vars"]
+                  }
+                  if promo_vars.get("stageFile") != stage_file:
+                      error("argocd/templates/kargo-stages.yaml",
+                            f"{app_name}/{stage} writes {promo_vars.get('stageFile')!r}, but "
+                            f"its Application reads {stage_file}.")
+                  if promo_vars.get("argocdApp") != f"{app_name}-{stage}":
+                      error("argocd/templates/kargo-stages.yaml",
+                            f"{app_name}/{stage} syncs Application "
+                            f"{promo_vars.get('argocdApp')!r}, which is not its own.")
+
+                  try:
+                      promoted_state = yaml.safe_load(open(stage_file))
+                  except FileNotFoundError:
+                      error(stage_file, f"{stage_file} is missing. The ApplicationSet's "
+                                        "generator reads it, so without it the stage "
+                                        "produces no Application at all.")
+                  else:
+                      for key in ("chartRevision", "image"):
+                          if key not in promoted_state:
+                              error(stage_file, f"{stage_file} has no {key!r}: it is what "
+                                                "the generator and the chart read back.")
+
+              # The two halves of the promise, stated once per application rather
+              # than per stage: somebody has to promote, and what they promote
+              # has to have run somewhere first. A change that keeps every object
+              # internally consistent can still delete the release path by
+              # rewriting values.yaml, which is what these catch.
+              gated = {n: c for n, c in app["stages"].items() if not c.get("autoPromotion")}
+              if not gated:
+                  error("argocd/values.yaml", f"No stage of {app_name} requires a person to "
+                                              "promote it. At least one must.")
+              elif not any(c.get("promotedFrom") for c in gated.values()):
+                  error("argocd/values.yaml",
+                        f"No stage of {app_name} both waits for a person and draws its "
+                        "Freight from another stage. Production may only run what staging "
+                        "has already run; taking Freight straight from the Warehouse would "
+                        "let an unproven build be promoted.")
+
+              for stage, cfg in app["stages"].items():
+                  upstream = cfg.get("promotedFrom")
+                  if upstream and upstream not in app["stages"]:
+                      error("argocd/values.yaml", f"{app_name}/{stage} is promoted from "
+                                                  f"{upstream!r}, which is not one of its "
+                                                  "stages.")
+
+          sys.exit(status)
+          PY
+
+  onboarding:
+    name: a new application is values-only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      # The framework's promise: onboarding an application is an entry under
+      # "apps:" — not a new template, not a Warehouse file of its own, and not a
+      # copy of the promotion steps. tests/onboarding-values.yaml is a second
+      # application expressed that way and deployed nowhere; this renders the
+      # chart with it on top and asserts that a complete, isolated release path
+      # appeared.
+      #
+      # A README sentence claiming this would not notice the day it stopped
+      # being true. This does.
+      - name: A values overlay produces a whole release path
+        run: |
+          helm template platform-gitops argocd -f tests/onboarding-values.yaml > /tmp/onboarded.yaml
+          python3 - <<'PY'
+          import sys, yaml
+
+          docs = [d for d in yaml.safe_load_all(open("/tmp/onboarded.yaml")) if d]
+          got = {(d["kind"], d["metadata"].get("namespace"), d["metadata"]["name"]) for d in docs}
+
+          status = 0
+          def want(kind, namespace, name, why):
+              global status
+              if (kind, namespace, name) not in got:
+                  print(f"::error file=tests/onboarding-values.yaml::onboarding produced no "
+                        f"{kind} {namespace or ''}/{name} — {why}")
+                  status = 1
+
+          want("Project", None, "onek8s-example", "an application needs its own Kargo Project")
+          want("ProjectConfig", "onek8s-example", "onek8s-example", "nothing would say which stages auto-promote")
+          want("Warehouse", "onek8s-example", "example", "nothing would turn its builds into Freight")
+          for stage in ("staging", "production"):
+              want("Stage", "onek8s-example", stage, "the release path would be incomplete")
+              want("ApplicationSet", "argocd", f"example-{stage}", "nothing would deploy it")
+
+          # Isolation: its own Project namespace, and promoters that are its own.
+          role = [d for d in docs if d["kind"] == "Role"
+                  and d["metadata"]["namespace"] == "onek8s-example"]
+          if not role:
+              print("::error file=argocd/templates/kargo-projects.yaml::the onboarded "
+                    "application got no promoter Role of its own.")
+              status = 1
+          else:
+              names = [r for rule in role[0]["rules"] for r in rule.get("resourceNames", [])]
+              if names != ["production"]:
+                  print(f"::error file=argocd/templates/kargo-projects.yaml::promoter Role "
+                        f"grants promote on {names}, expected only the gated stage.")
+                  status = 1
+
+          # The part that must NOT multiply: one shared promotion procedure,
+          # however many applications there are.
+          tasks = [d for d in docs if d["kind"] == "ClusterPromotionTask"]
+          if len(tasks) != 1:
+              print(f"::error file=argocd/templates/kargo-promotion-task.yaml::{len(tasks)} "
+                    "ClusterPromotionTasks rendered for two applications. The promotion "
+                    "procedure is shared; one per application is how a platform ends up with "
+                    "fifty copies of one bug.")
+              status = 1
+          for stage in [d for d in docs if d["kind"] == "Stage"]:
+              steps = stage["spec"]["promotionTemplate"]["spec"]["steps"]
+              if [s.get("task", {}).get("name") for s in steps] != [tasks[0]["metadata"]["name"]]:
+                  print(f"::error file=argocd/templates/kargo-stages.yaml::Stage "
+                        f"{stage['metadata']['namespace']}/{stage['metadata']['name']} does not "
+                        "delegate to the shared ClusterPromotionTask.")
+                  status = 1
 
           sys.exit(status)
           PY

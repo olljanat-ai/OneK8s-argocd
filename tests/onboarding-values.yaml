@@ -1,0 +1,42 @@
+# A second application, as a values overlay — the whole of what onboarding one
+# costs in this framework.
+#
+# It is not deployed anywhere: PR validation renders the chart with this file on
+# top and asserts that a complete release path appears (Kargo Project,
+# Warehouse, two Stages, two auto-synced Applications, one authorized per
+# stage), reusing the same ClusterPromotionTask as everything else.
+#
+# That check is the framework's actual promise. If onboarding an application
+# ever starts to require a new template, a new Warehouse file or a copy of the
+# promotion steps, this render is what fails — while a README sentence claiming
+# otherwise would not.
+apps:
+  example:
+    enabled: true
+    chartPath: apps/example/chart
+    hostPrefix: example
+    parameters:
+      welcomeMessage: Hello from {{ .cloud }} ({{ .stage }})
+    release:
+      image:
+        repository: ghcr.io/olljanat-ai/onek8s-hello/example
+        # The other selection strategy, on purpose: an application with real
+        # releases pins by version and constrains what a stage may take. Both
+        # shapes have to keep rendering.
+        selectionStrategy: SemVer
+        semverConstraint: ^1.0.0
+        discoveryLimit: 10
+      interval: 10m
+    promoters:
+      - "00000000-0000-0000-0000-000000000000"
+    stages:
+      staging:
+        cloud: azure
+        cluster: in-cluster
+        promotedFrom: ""
+        autoPromotion: true
+      production:
+        cloud: aws
+        promotedFrom: staging
+        autoPromotion: false
+        soakTime: 2h

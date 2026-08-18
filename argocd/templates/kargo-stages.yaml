@@ -1,0 +1,96 @@
+{{- $root := . }}
+# Each application's release path, one Stage per cluster it travels to.
+#
+# A Stage holds one piece of Freight and knows how to put it there. Promoting is
+# not "press sync": it is the ClusterPromotionTask in kargo-promotion-task.yaml,
+# which clones the delivery-plane repository, writes the promoted image tag and
+# chart revision into "stages/<app>/<stage>.yaml", commits, pushes, and then
+# asks Argo CD to sync the Application that reads that file. So every promotion
+# leaves a commit naming what moved, when, and — for the ones a person asked for
+# — who asked.
+#
+# What a Stage owns is what is genuinely its own, and it is two fields. Both are
+# needed to make a gate, and neither is a sync policy:
+#
+#   sources.stages   a downstream stage draws Freight from the stage before it,
+#                    not from the Warehouse. A build that has never run in
+#                    staging cannot be put in production, even by somebody
+#                    allowed to promote.
+#   autoPromotion    false in the ProjectConfig, so Kargo creates no Promotion
+#                    for it. The Freight becomes available and waits.
+{{- range $name, $app := .Values.apps }}
+{{- if and (include "onek8s.appEnabled" (dict "root" $root "app" $app)) (include "onek8s.kargoManaged" (dict "root" $root "app" $app)) }}
+{{- $project := include "onek8s.kargoProject" (dict "root" $root "name" $name) }}
+{{- range $stage, $cfg := $app.stages }}
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: {{ $stage | quote }}
+  namespace: {{ $project | quote }}
+  annotations:
+    kargo.akuity.io/description: >-
+      {{ $name }} on {{ $cfg.cloud }} ({{ $root.Values.environment }}) —
+      https://{{ $cfg.cloud }}-{{ $app.hostPrefix }}.{{ $root.Values.domain }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    app.kubernetes.io/name: {{ $name }}
+    onek8s.io/cloud: {{ $cfg.cloud | quote }}
+    onek8s.io/environment: {{ $root.Values.environment | quote }}
+    onek8s.io/stage: {{ $stage | quote }}
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: {{ $name | quote }}
+      sources:
+        {{- if $cfg.promotedFrom }}
+        # Upstream, not the Warehouse: this stage can only receive what the
+        # stage before it has already run.
+        stages:
+          - {{ $cfg.promotedFrom | quote }}
+        {{- with $cfg.soakTime }}
+        # ...and only after it has run there this long.
+        requiredSoakTime: {{ . | quote }}
+        {{- end }}
+        {{- else }}
+        # The head of the release path: new Freight enters here.
+        direct: true
+        {{- end }}
+
+  promotionTemplate:
+    spec:
+      # Inherited by the task, which declares every one of them as required.
+      # This block is the whole of what makes the shared procedure act on THIS
+      # application and THIS stage.
+      vars:
+        - name: app
+          value: {{ $name | quote }}
+        - name: stage
+          value: {{ $stage | quote }}
+        - name: repoURL
+          value: {{ $root.Values.repoURL | quote }}
+        - name: branch
+          value: {{ $root.Values.targetRevision | quote }}
+        - name: stageFile
+          value: {{ include "onek8s.stageFile" (dict "root" $root "name" $name "stage" $stage) | quote }}
+        - name: appsRepoURL
+          value: {{ include "onek8s.appsRepoURL" (dict "root" $root "app" $app) | quote }}
+        - name: imageRepoURL
+          value: {{ $app.release.image.repository | quote }}
+        - name: argocdApp
+          value: {{ printf "%s-%s" $name $stage | quote }}
+        - name: argocdNamespace
+          value: {{ $root.Values.argocdNamespace | quote }}
+        - name: authorName
+          value: {{ $root.Values.kargo.author.name | quote }}
+        - name: authorEmail
+          value: {{ $root.Values.kargo.author.email | quote }}
+
+      steps:
+        - task:
+            name: {{ $root.Values.kargo.promotionTask | quote }}
+            kind: ClusterPromotionTask
+{{- end }}
+{{- end }}
+{{- end }}

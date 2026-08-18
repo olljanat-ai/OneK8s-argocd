@@ -1,30 +1,38 @@
-{{- if .Values.kargo.enabled }}
-{{- $kargo := .Values.kargo }}
-# The Kargo Project the platform's applications are promoted in, and the rules
+{{- $root := . }}
+# One Kargo Project per application that travels a release path, and the rules
 # that make one of its stages a gate.
 #
-# A Kargo Project is cluster-scoped and Kargo creates a namespace of the same
-# name for it; every Warehouse, Stage, Promotion and Freight below lives there.
-# That namespace is also where Kargo's own RBAC is written, which is why the
-# guest list for a promotion is here rather than in Terraform: it belongs beside
-# the Stage it guards, and changing it is a reviewed commit.
+# Per application rather than one for the platform, because a Project is Kargo's
+# unit of isolation: its own namespace, its own Freight, its own Stage names
+# (which would otherwise collide — every application wants a stage called
+# "production"), its own promoters, and its own place to hold a credential. The
+# thing that must NOT be per application, how a promotion is performed, is the
+# single ClusterPromotionTask next to this file.
 #
-# Sync waves matter on a cold apply. The Project has to exist before anything
-# namespaced in it can be created, and the namespace itself appears a moment
-# later, when Kargo reconciles the Project — the root Application retries
-# (gitops/root-app.tf in OneK8s), so the second attempt finds it.
+# A Kargo Project is cluster-scoped and Kargo creates a namespace of the same
+# name for it. Sync waves matter on a cold apply: the Project has to exist
+# before anything namespaced in it can be created, and the namespace itself
+# appears a moment later, when Kargo reconciles the Project — the root
+# Application retries (gitops/root-app.tf in OneK8s), so the second attempt
+# finds it.
+{{- range $name, $app := .Values.apps }}
+{{- if and (include "onek8s.appEnabled" (dict "root" $root "app" $app)) (include "onek8s.kargoManaged" (dict "root" $root "app" $app)) }}
+{{- $project := include "onek8s.kargoProject" (dict "root" $root "name" $name) }}
+{{- $promoters := default $root.Values.kargo.promoters $app.promoters }}
+---
 apiVersion: kargo.akuity.io/v1alpha1
 kind: Project
 metadata:
-  name: {{ $kargo.project | quote }}
+  name: {{ $project | quote }}
   annotations:
     argocd.argoproj.io/sync-wave: "-2"
     kargo.akuity.io/description: >-
-      OneK8s platform applications ({{ .Values.environment }}) — the release
-      path of the hello application across the clouds of this environment.
+      The release path of the {{ $name }} application across the clouds of the
+      {{ $root.Values.environment }} environment.
   labels:
     app.kubernetes.io/part-of: onek8s
-    onek8s.io/environment: {{ .Values.environment | quote }}
+    app.kubernetes.io/name: {{ $name }}
+    onek8s.io/environment: {{ $root.Values.environment | quote }}
 ---
 # Promotion policies: which stages Kargo may promote by itself.
 #
@@ -32,24 +40,25 @@ metadata:
 # is not in this list" and "production is in this list and says false" read the
 # same to Kargo but not to a person — and this is the file somebody will read
 # when they want to know whether the gate is still there. PR validation asserts
-# the rendered values against apps.hello.stages for the same reason.
+# the rendered values against apps.<name>.stages for the same reason.
 apiVersion: kargo.akuity.io/v1alpha1
 kind: ProjectConfig
 metadata:
-  name: {{ $kargo.project | quote }}
-  namespace: {{ $kargo.project | quote }}
+  name: {{ $project | quote }}
+  namespace: {{ $project | quote }}
   annotations:
     argocd.argoproj.io/sync-wave: "-1"
   labels:
     app.kubernetes.io/part-of: onek8s
-    onek8s.io/environment: {{ .Values.environment | quote }}
+    app.kubernetes.io/name: {{ $name }}
+    onek8s.io/environment: {{ $root.Values.environment | quote }}
 spec:
   promotionPolicies:
-    {{- range $stage, $cfg := .Values.apps.hello.stages }}
+    {{- range $stage, $cfg := $app.stages }}
     - stage: {{ $stage | quote }}
       autoPromotionEnabled: {{ $cfg.autoPromotion | default false }}
     {{- end }}
-  {{- if $kargo.webhook.enabled }}
+  {{- if $root.Values.kargo.webhook.enabled }}
   # A push tells Kargo to look at once, instead of on the Warehouse's interval.
   # The Secret holding the shared secret is created out of band in this
   # namespace — it is a credential, not configuration.
@@ -57,37 +66,37 @@ spec:
     - name: github
       github:
         secretRef:
-          name: {{ $kargo.webhook.secretName | quote }}
+          name: {{ $root.Values.kargo.webhook.secretName | quote }}
   {{- end }}
-{{- if $kargo.promoters }}
+{{- if $promoters }}
 ---
-# Who may open the gate.
+# Who may open this application's gate.
 #
 # Kargo maps an identity to a ServiceAccount in the Project's namespace by
 # matching the claims on its ID token, and that ServiceAccount's Roles are what
 # it may do. So this is three objects saying one thing: members of these Entra
-# groups may create a Promotion for the stages that are not auto-promoted, in
-# this Project, and nothing else — not edit a Stage, not change what the
-# Warehouse watches, not promote in another Project.
+# groups may create a Promotion for the stages of THIS application that are not
+# auto-promoted, and nothing else — not edit a Stage, not change what the
+# Warehouse watches, not promote another application.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: promoter
-  namespace: {{ $kargo.project | quote }}
+  namespace: {{ $project | quote }}
   annotations:
-    rbac.kargo.akuity.io/claims: {{ dict "groups" $kargo.promoters | toJson | quote }}
+    rbac.kargo.akuity.io/claims: {{ dict "groups" $promoters | toJson | quote }}
   labels:
     app.kubernetes.io/part-of: onek8s
-    onek8s.io/environment: {{ .Values.environment | quote }}
+    app.kubernetes.io/name: {{ $name }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: promoter
-  namespace: {{ $kargo.project | quote }}
+  namespace: {{ $project | quote }}
   labels:
     app.kubernetes.io/part-of: onek8s
-    onek8s.io/environment: {{ .Values.environment | quote }}
+    app.kubernetes.io/name: {{ $name }}
 rules:
   # Enough to see what is being promoted, and no writes.
   - apiGroups: [kargo.akuity.io]
@@ -99,7 +108,7 @@ rules:
   - apiGroups: [kargo.akuity.io]
     resources: [stages]
     resourceNames:
-      {{- range $stage, $cfg := .Values.apps.hello.stages }}
+      {{- range $stage, $cfg := $app.stages }}
       {{- if not $cfg.autoPromotion }}
       - {{ $stage | quote }}
       {{- end }}
@@ -115,10 +124,10 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: promoter
-  namespace: {{ $kargo.project | quote }}
+  namespace: {{ $project | quote }}
   labels:
     app.kubernetes.io/part-of: onek8s
-    onek8s.io/environment: {{ .Values.environment | quote }}
+    app.kubernetes.io/name: {{ $name }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -126,6 +135,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: promoter
-    namespace: {{ $kargo.project | quote }}
+    namespace: {{ $project | quote }}
+{{- end }}
 {{- end }}
 {{- end }}

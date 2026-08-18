@@ -1,0 +1,131 @@
+{{- if .Values.kargo.enabled }}
+{{- $kargo := .Values.kargo }}
+# The Kargo Project the platform's applications are promoted in, and the rules
+# that make one of its stages a gate.
+#
+# A Kargo Project is cluster-scoped and Kargo creates a namespace of the same
+# name for it; every Warehouse, Stage, Promotion and Freight below lives there.
+# That namespace is also where Kargo's own RBAC is written, which is why the
+# guest list for a promotion is here rather than in Terraform: it belongs beside
+# the Stage it guards, and changing it is a reviewed commit.
+#
+# Sync waves matter on a cold apply. The Project has to exist before anything
+# namespaced in it can be created, and the namespace itself appears a moment
+# later, when Kargo reconciles the Project — the root Application retries
+# (gitops/root-app.tf in OneK8s), so the second attempt finds it.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Project
+metadata:
+  name: {{ $kargo.project | quote }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    kargo.akuity.io/description: >-
+      OneK8s platform applications ({{ .Values.environment }}) — the release
+      path of the hello application across the clouds of this environment.
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+---
+# Promotion policies: which stages Kargo may promote by itself.
+#
+# Every stage is listed, including the ones that are false, because "production
+# is not in this list" and "production is in this list and says false" read the
+# same to Kargo but not to a person — and this is the file somebody will read
+# when they want to know whether the gate is still there. PR validation asserts
+# the rendered values against apps.hello.stages for the same reason.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ProjectConfig
+metadata:
+  name: {{ $kargo.project | quote }}
+  namespace: {{ $kargo.project | quote }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+spec:
+  promotionPolicies:
+    {{- range $stage, $cfg := .Values.apps.hello.stages }}
+    - stage: {{ $stage | quote }}
+      autoPromotionEnabled: {{ $cfg.autoPromotion | default false }}
+    {{- end }}
+  {{- if $kargo.webhook.enabled }}
+  # A push tells Kargo to look at once, instead of on the Warehouse's interval.
+  # The Secret holding the shared secret is created out of band in this
+  # namespace — it is a credential, not configuration.
+  webhookReceivers:
+    - name: github
+      github:
+        secretRef:
+          name: {{ $kargo.webhook.secretName | quote }}
+  {{- end }}
+{{- if $kargo.promoters }}
+---
+# Who may open the gate.
+#
+# Kargo maps an identity to a ServiceAccount in the Project's namespace by
+# matching the claims on its ID token, and that ServiceAccount's Roles are what
+# it may do. So this is three objects saying one thing: members of these Entra
+# groups may create a Promotion for the stages that are not auto-promoted, in
+# this Project, and nothing else — not edit a Stage, not change what the
+# Warehouse watches, not promote in another Project.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promoter
+  namespace: {{ $kargo.project | quote }}
+  annotations:
+    rbac.kargo.akuity.io/claims: {{ dict "groups" $kargo.promoters | toJson | quote }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: promoter
+  namespace: {{ $kargo.project | quote }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+rules:
+  # Enough to see what is being promoted, and no writes.
+  - apiGroups: [kargo.akuity.io]
+    resources: [freights, projectconfigs, promotions, stages, warehouses]
+    verbs: [get, list, watch]
+  # The gate itself. "promote" is scoped by name, so this grants exactly the
+  # stages that wait for a person — a stage Kargo promotes by itself needs no
+  # human and is not listed.
+  - apiGroups: [kargo.akuity.io]
+    resources: [stages]
+    resourceNames:
+      {{- range $stage, $cfg := .Values.apps.hello.stages }}
+      {{- if not $cfg.autoPromotion }}
+      - {{ $stage | quote }}
+      {{- end }}
+      {{- end }}
+    verbs: [promote]
+  # Creating the Promotion object is the act of promoting; Promotions are
+  # immutable once created, so there is nothing further to grant.
+  - apiGroups: [kargo.akuity.io]
+    resources: [promotions]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: promoter
+  namespace: {{ $kargo.project | quote }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: promoter
+subjects:
+  - kind: ServiceAccount
+    name: promoter
+    namespace: {{ $kargo.project | quote }}
+{{- end }}
+{{- end }}

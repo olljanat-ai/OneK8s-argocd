@@ -12,9 +12,9 @@
 # cluster and the production cluster of the hello application.
 environment: prototype
 
-# This repository. It is what the root Application syncs (the objects in
-# templates/ are rendered from it) and it is allow-listed in the AppProject
-# alongside the applications' repository.
+# This repository. Three things read it: the root Application syncs it (the
+# objects in templates/ are rendered from it), the AppProject allow-lists it,
+# and Kargo commits to it — a promotion is a commit under "stages/" here.
 repoURL: https://github.com/olljanat-ai/OneK8s-argocd.git
 targetRevision: main
 
@@ -53,6 +53,71 @@ sql:
 project:
   name: onek8s-platform
 
+# -----------------------------------------------------------------------------
+# Kargo: the promotion engine in front of Argo CD.
+#
+# Argo CD answers "is the cluster what Git says it is" and has no opinion about
+# which revision belongs on which cluster. Kargo answers that second question
+# and writes the answer down: a Warehouse watches the application's image and
+# chart and freezes each new build as a piece of Freight; a Stage carries one
+# piece of Freight; and promoting a Stage is a commit under "stages/" in this
+# repository, which Argo CD then syncs like any other commit.
+#
+# That is why no Application here is left un-automated any more. The gate in
+# front of production is not "Argo CD has been told not to apply this" — it is
+# "no commit says production runs that build yet", which cannot be undone by
+# adding a sync policy back, is visible in `git log`, and names the person who
+# opened it.
+#
+# enabled is set by Terraform from the hub's outputs: false when the hub was
+# applied with enable_kargo = false, and then this chart renders no Kargo
+# objects at all rather than a release path nothing reconciles.
+kargo:
+  enabled: true
+
+  # Namespace the Kargo controller runs in on the hub. Informational here — the
+  # objects below live in the Project's namespace, not this one.
+  namespace: kargo
+
+  # Base URL of the Kargo UI, for the deep link on each Stage. Empty when the
+  # hub runs Kargo controller-only (no app registration configured yet).
+  url: ""
+
+  # The Kargo Project the platform's applications are promoted in. Kargo creates
+  # a namespace of the same name and every Warehouse, Stage and Promotion below
+  # lives in it.
+  project: onek8s-hello
+
+  # Where promotions are written, relative to the root of this repository:
+  # "<stagesPath>/<app>/<stage>.yaml". Those files are the ones Argo CD reads
+  # back — see templates/applicationset-hello.yaml.
+  stagesPath: stages
+
+  # Authorship of the commits Kargo makes. It is a bot, and the history should
+  # say so plainly rather than borrow a person's name.
+  author:
+    name: kargo
+    email: kargo@onek8s.lol
+
+  # Who may promote to a stage that is not auto-promoted, as Entra ID group
+  # object IDs (the "groups" claim Kargo's OIDC config requests). This is the
+  # approval gate's guest list, and it is deliberately here rather than in
+  # Terraform: it belongs beside the Stage it guards, and changing it is a
+  # reviewed commit.
+  #
+  # Empty means only Kargo's own admins can promote, which is the safe default
+  # but not a useful one — an environment that wants a named group of promoters
+  # lists it here.
+  promoters: []
+
+  # A GitHub webhook that tells Kargo to re-check the repositories at once
+  # instead of on the Warehouse's polling interval. The receiver needs a shared
+  # secret, which is not configuration and is not committed: create the Secret
+  # in the Project's namespace out of band and name it here (see the README).
+  webhook:
+    enabled: false
+    secretName: kargo-github-webhook
+
 apps:
   hello:
     enabled: true
@@ -71,12 +136,34 @@ apps:
       name: test
 
     # ---------------------------------------------------------------------
-    # The application's own release path: one stage per cluster, in order.
+    # What a piece of this application's Freight is made of: one image build
+    # and the chart it is deployed with. Both are watched by the Warehouse, and
+    # both are pinned per stage by a promotion — so a chart change reaches
+    # production the same way an image does, through the gate, rather than
+    # slipping past it because only the image was ever promoted.
+    # ---------------------------------------------------------------------
+    image:
+      repository: ghcr.io/olljanat-ai/onek8s-hello/hello
+      # Immutable build tags only. The build workflow in OneK8s-hello pushes
+      # "sha-<short>" and nothing else — no moving "latest" — which is what
+      # makes "the tag in Git" and "the image running" the same statement.
+      tagRegex: ^sha-[0-9a-f]{7,40}$
+      # How many tags Kargo considers when looking for the newest build. The
+      # strategy is NewestBuild, which reads each candidate's creation time, so
+      # this is a real cost per discovery run rather than a formality.
+      discoveryLimit: 20
+
+    # How often the Warehouse looks for a new build or a chart change. The
+    # webhook above makes this a backstop rather than the normal path.
+    interval: 5m
+
+    # ---------------------------------------------------------------------
+    # The application's release path: one Kargo Stage per cluster, in order.
     # This is what makes the two clouds mean something different rather than
     # being two copies of the same deployment:
     #
-    #   staging     Azure (AKS, the hub)   auto-synced — every commit lands here
-    #   production  AWS   (EKS, a spoke)   manual — a human promotes it
+    #   staging     Azure (AKS, the hub)   auto-promoted: every new build lands
+    #   production  AWS   (EKS, a spoke)   promoted by a human, from staging
     #
     # A stage names either a "cluster" (a fixed cluster Argo CD already knows,
     # used for the hub, which has no labelled cluster Secret to select on) or
@@ -84,11 +171,16 @@ apps:
     # registered for this environment — so a cloud that is not a spoke here
     # simply produces no Application).
     #
-    # autoSync is the gate. With it false the Application is created and
-    # tracked but never synced by the controller: Argo CD shows it OutOfSync
-    # and waits for a human — the Sync button, `argocd app sync`, or the
-    # approval-gated "Promote to production" workflow in this repository.
-    # Nothing reaches AWS without one of those.
+    # Two fields make the gate:
+    #
+    #   autoPromotion  false means Kargo creates no Promotion by itself. The
+    #                  Freight becomes *available* to the stage and waits for a
+    #                  person, in the UI, with `kargo promote`, or as a
+    #                  Promotion object.
+    #   promotedFrom   the stage this one draws Freight from. Production may
+    #                  only take what staging has already run, so an untested
+    #                  build cannot be promoted straight to AWS even by
+    #                  somebody who is allowed to promote.
     # ---------------------------------------------------------------------
     stages:
       staging:
@@ -97,23 +189,29 @@ apps:
         # "in-cluster" and it carries no cluster Secret, so it is named rather
         # than selected.
         cluster: in-cluster
-        autoSync: true
+        # Empty promotedFrom means the Warehouse itself: staging is where new
+        # Freight enters the release path.
+        promotedFrom: ""
+        autoPromotion: true
       production:
         # Selected by label: the AWS spoke's cluster Secret is written and
         # labelled by the gitops stack in the OneK8s repository.
         cloud: aws
-        autoSync: false
-        # Optional: pin production to a tag or a commit instead of following
-        # appsTargetRevision. Empty means "the same revision staging tracks",
-        # and then a promotion is the act of syncing rather than of moving a
-        # pointer.
-        targetRevision: ""
+        promotedFrom: staging
+        autoPromotion: false
+        # Optional: how long a piece of Freight must have been running in the
+        # stage it comes from before it can be promoted on. Empty means no
+        # soak, which is right for a lab; "2h" would mean production can only
+        # take a build staging has survived for two hours.
+        soakTime: ""
 
   # The Azure-only example: a database application authenticating with the
   # tenant's managed identity. It is deployed to the hub and nowhere else, and
   # only when "sql" above is filled in — its database is an Azure resource and
   # its identity is an Entra one, so it has no production stage on AWS to be
-  # promoted to.
+  # promoted to, and no Kargo objects either: an application with one stage has
+  # no release *path*, and pretending otherwise would add a promotion that
+  # promotes nothing anywhere.
   dbHello:
     enabled: true
     # Chart path inside the applications' repository.

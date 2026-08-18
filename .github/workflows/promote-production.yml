@@ -17,7 +17,10 @@ name: Promote to production
 #   plan     what would change on AWS — no credentials beyond read
 #   promote  waits for approval, then syncs and waits for the app to be healthy
 #
-# Requires an Argo CD API account token:
+# Requires a token for the hub's `ci` account. The account is declared by
+# OneK8s' foundations/azure (token-only, bound to role:ci: read any
+# application, sync the onek8s-platform ones); the token is minted by an admin
+# and pasted in here.
 #   vars.ARGOCD_SERVER       e.g. argocd.onek8s.lol
 #   secrets.ARGOCD_AUTH_TOKEN  `argocd account generate-token --account ci`
 on:

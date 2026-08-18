@@ -98,11 +98,15 @@ Neither replaces the other: the workflow is the audited path, the missing
 1. **Settings → Environments → `production`** — add the people or teams allowed
    to promote as *required reviewers*.
 2. `vars.ARGOCD_SERVER` — the hub's host, e.g. `argocd.onek8s.lol`.
-3. `secrets.ARGOCD_AUTH_TOKEN` — a token for an Argo CD API account that may
-   sync this project's applications:
+3. `secrets.ARGOCD_AUTH_TOKEN` — a token for the `ci` account. The account
+   itself is part of the hub: OneK8s' `foundations/azure` declares it
+   token-only, bound to `role:ci`, which may read every application and sync
+   the ones in this chart's `onek8s-platform` project. Only its token is
+   manual, and only an Argo CD admin can mint one:
 
    ```bash
-   argocd account generate-token --account ci --grpc-web
+   argocd login "$ARGOCD_SERVER" --grpc-web --sso
+   argocd account generate-token --account ci --grpc-web --expires-in 90d
    ```
 
 Without those, promotion is the Argo CD UI or the CLI — the gate is unaffected.

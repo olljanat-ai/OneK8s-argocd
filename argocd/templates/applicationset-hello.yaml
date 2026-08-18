@@ -1,0 +1,146 @@
+{{- if .Values.apps.hello.enabled }}
+{{- $root := . }}
+{{- $app := .Values.apps.hello }}
+{{- $secret := $app.secret }}
+{{- /*
+The tenant's test secret, spelled the way each backend spells it. This is the
+only string on the platform that is not the same word on every cloud, and
+resolving it here is deliberate: Key Vault names are flat because each
+environment has its own vault, while Secrets Manager is account-wide, so the
+tenant's IAM role there is restricted to "<environment>/<tenant>/*"
+(modules/tenant-namespace/aws/main.tf in the OneK8s repository).
+
+The application's chart is handed the finished key and never learns which cloud
+it landed on — a developer's chart has no business branching on that.
+*/}}
+{{- $flatKey := printf "%s-%s" .Values.tenant $secret.name }}
+{{- $pathKey := printf "%s/%s/%s" .Values.environment .Values.tenant $secret.name }}
+# "Deploy the hello app along its release path", as one object per stage.
+#
+#   hello-staging     Azure / AKS (the hub)   auto-synced
+#   hello-production  AWS   / EKS (a spoke)   manual: a human promotes it
+#
+# One ApplicationSet per stage rather than one for the whole application,
+# because the stages differ in the one field that must not be got wrong: the
+# staging Application carries syncPolicy.automated and the production one
+# deliberately does not. Keeping that inside a single template would mean
+# patching it back out per generator; here each stage's sync policy is written
+# where it can be read.
+#
+# The stages are still one list in values.yaml (apps.hello.stages) and this file
+# ranges over it, so adding a third stage is a value, not a template.
+#
+# How the cluster is found differs per stage, and follows from the topology
+# rather than from the stage: the hub has no cluster Secret and therefore no
+# labels to select on, so it is named ("in-cluster"), while a spoke is matched
+# by the labels the gitops stack put on the Secret it wrote. A stage whose cloud
+# is not registered as a spoke in this environment generates nothing at all —
+# there is no cluster to deploy to and nothing to keep in sync between the two.
+#
+# NOTE ON BRACES: Helm and Argo CD both use Go templates, and this file is
+# rendered by both. Anything wrapped in a backtick-quoted Helm literal comes
+# through untouched and is evaluated later by the ApplicationSet controller;
+# everything else is substituted by Helm at sync time from values.yaml.
+{{- range $stage, $cfg := $app.stages }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: hello-{{ $stage }}
+  namespace: {{ $root.Values.argocdNamespace }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ $root.Values.environment | quote }}
+    onek8s.io/stage: {{ $stage | quote }}
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  generators:
+    {{- if $cfg.cluster }}
+    # A named cluster: the hub (AKS), which Argo CD addresses as "in-cluster".
+    - list:
+        elements:
+          - values:
+              cloud: {{ $cfg.cloud | quote }}
+              cluster: {{ $cfg.cluster | quote }}
+    {{- else }}
+    # The spoke of this cloud, if the gitops stack registered one for this
+    # environment. No spoke, no Application.
+    - clusters:
+        selector:
+          matchLabels:
+            onek8s.io/environment: {{ $root.Values.environment | quote }}
+            onek8s.io/cloud: {{ $cfg.cloud | quote }}
+        values:
+          cloud: {{ $cfg.cloud | quote }}
+          cluster: '{{`{{ .name }}`}}'
+    {{- end }}
+
+  template:
+    metadata:
+      name: hello-{{ $stage }}
+      labels:
+        app.kubernetes.io/part-of: onek8s
+        onek8s.io/cloud: {{ $cfg.cloud | quote }}
+        onek8s.io/environment: {{ $root.Values.environment | quote }}
+        onek8s.io/stage: {{ $stage | quote }}
+    spec:
+      project: {{ $root.Values.project.name }}
+      source:
+        # The applications' repository, not this one: this chart says where the
+        # hello app is deployed, apps/hello/chart says what it is.
+        repoURL: {{ $root.Values.appsRepoURL | quote }}
+        targetRevision: {{ $cfg.targetRevision | default $root.Values.appsTargetRevision | quote }}
+        path: {{ $app.path | quote }}
+        helm:
+          # Parameters rather than a values block: they are plain strings, so
+          # the substitutions above are unambiguous, and they override the
+          # chart's own values.yaml without duplicating it.
+          parameters:
+            - name: cloud
+              value: {{ $cfg.cloud | quote }}
+            - name: environment
+              value: {{ $root.Values.environment | quote }}
+            - name: tenant
+              value: {{ $root.Values.tenant | quote }}
+            # One label deep, which is all the *.{{ $root.Values.domain }} wildcard covers.
+            - name: ingress.host
+              value: '{{ $cfg.cloud }}-{{ $app.hostPrefix }}.{{ $root.Values.domain }}'
+            - name: secret.name
+              value: {{ $secret.name | quote }}
+            # Resolved here, from the two spellings computed above: a path on
+            # Secrets Manager, a flat name everywhere else. The stage fixes the
+            # cloud, so this is decided at render time rather than per cluster.
+            - name: secret.remoteKey
+              value: {{ if eq $cfg.cloud "aws" }}{{ $pathKey | quote }}{{ else }}{{ $flatKey | quote }}{{ end }}
+            - name: welcomeMessage
+              value: 'Welcome to OneK8s on {{ $cfg.cloud }} ({{ $root.Values.environment }}, {{ $stage }})!'
+      destination:
+        # By name, not by server URL: a spoke's API endpoint is whatever EKS
+        # happened to hand out, and Argo CD already knows it from the cluster
+        # Secret the gitops stack wrote.
+        name: '{{`{{ .values.cluster }}`}}'
+        namespace: {{ $root.Values.tenant | quote }}
+      syncPolicy:
+        {{- if $cfg.autoSync }}
+        # Auto-synced: this stage is what "merged to main" means.
+        automated:
+          prune: true
+          selfHeal: true
+        {{- else }}
+        # No automated block, on purpose: this is the approval gate. The
+        # Application is created and kept up to date as a *comparison* — Argo CD
+        # shows it OutOfSync as soon as the chart or the image tag moves — but
+        # nothing is applied to the cluster until a human syncs it, from the UI,
+        # with `argocd app sync hello-{{ $stage }}`, or through the
+        # environment-protected "Promote to production" workflow.
+        {{- end }}
+        syncOptions:
+          # The namespace belongs to the tenants stack. If it is missing, the
+          # sync should fail loudly rather than have Argo CD create a namespace
+          # with none of the tenant's quota, network policy or SecretStore.
+          - CreateNamespace=false
+      revisionHistoryLimit: 3
+{{- end }}
+{{- end }}

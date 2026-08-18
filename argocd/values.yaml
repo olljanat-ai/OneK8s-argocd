@@ -1,0 +1,125 @@
+# Defaults for a manual `helm template`. In a deployed environment every value
+# down to "apps" is overridden by the root Application, which OneK8s'
+# gitops/root-app.tf renders from var.environment and var.platform_apps — so one
+# copy of this chart serves prototype, dev, staging and prod without a
+# per-environment directory.
+
+# Selects the spokes an ApplicationSet's cluster generator matches
+# (onek8s.io/environment on the cluster Secret), and is passed on to the
+# applications themselves. This is the *platform* environment — which set of
+# foundations these clusters belong to — and it is a different axis from the
+# per-application stages below: one platform environment holds both the staging
+# cluster and the production cluster of the hello application.
+environment: prototype
+
+# This repository. It is what the root Application syncs (the objects in
+# templates/ are rendered from it) and it is allow-listed in the AppProject
+# alongside the applications' repository.
+repoURL: https://github.com/olljanat-ai/OneK8s-argocd.git
+targetRevision: main
+
+# Where the applications' charts come from. Separate from the repository above
+# on purpose: an application's source and chart belong to the team that owns the
+# application, while the Argo CD objects that deploy it belong to the platform.
+# A developer changing a chart never touches the delivery plane, and a change to
+# the delivery plane never rebuilds an image.
+appsRepoURL: https://github.com/olljanat-ai/OneK8s-hello.git
+appsTargetRevision: main
+
+# Namespace the Argo CD extension is released into on the hub.
+argocdNamespace: argocd
+
+# The wildcard the platform ingress serves. Application hosts are one label
+# deep under it: "<cloud>-<app>.<domain>".
+domain: onek8s.lol
+
+# Tenant namespace the platform's example applications are released into. It is
+# created by the tenants stack — Argo CD never creates it — and its namespaced
+# SecretStore is what the applications read secrets through.
+tenant: team-alpha
+
+# The Azure SQL database the db-hello application uses, handed down from the
+# Azure foundation's outputs by OneK8s' gitops/root-app.tf. Neither value is a
+# secret: a host name and a database name authorize nobody, and the application
+# authenticates with the tenant's managed identity.
+#
+# Empty means this environment's foundation was applied with enable_sql =
+# false, and then the db-hello ApplicationSet is not rendered at all — no
+# database, no application, and nothing to keep in sync between the two.
+sql:
+  server: ""
+  database: ""
+
+project:
+  name: onek8s-platform
+
+apps:
+  hello:
+    enabled: true
+    # Chart path inside the applications' repository.
+    path: apps/hello/chart
+    # Host label: "<cloud>-hello.<domain>".
+    hostPrefix: hello
+    # The tenant secret the application displays. Its name is the tenant's, not
+    # a cloud's; the ApplicationSet turns it into the key each cloud's backend
+    # actually uses ("<tenant>-<name>", or "<environment>/<tenant>/<name>" on
+    # AWS Secrets Manager) and passes that to the chart ready-made.
+    #
+    # It must match TEST_SECRET in OneK8s' .github/workflows/renew-certificate.yml,
+    # which is what writes the value into every backend.
+    secret:
+      name: test
+
+    # ---------------------------------------------------------------------
+    # The application's own release path: one stage per cluster, in order.
+    # This is what makes the two clouds mean something different rather than
+    # being two copies of the same deployment:
+    #
+    #   staging     Azure (AKS, the hub)   auto-synced — every commit lands here
+    #   production  AWS   (EKS, a spoke)   manual — a human promotes it
+    #
+    # A stage names either a "cluster" (a fixed cluster Argo CD already knows,
+    # used for the hub, which has no labelled cluster Secret to select on) or
+    # only a "cloud" (matched by label against the spokes the gitops stack
+    # registered for this environment — so a cloud that is not a spoke here
+    # simply produces no Application).
+    #
+    # autoSync is the gate. With it false the Application is created and
+    # tracked but never synced by the controller: Argo CD shows it OutOfSync
+    # and waits for a human — the Sync button, `argocd app sync`, or the
+    # approval-gated "Promote to production" workflow in this repository.
+    # Nothing reaches AWS without one of those.
+    # ---------------------------------------------------------------------
+    stages:
+      staging:
+        cloud: azure
+        # The hub is not a spoke: Argo CD addresses the cluster it runs on as
+        # "in-cluster" and it carries no cluster Secret, so it is named rather
+        # than selected.
+        cluster: in-cluster
+        autoSync: true
+      production:
+        # Selected by label: the AWS spoke's cluster Secret is written and
+        # labelled by the gitops stack in the OneK8s repository.
+        cloud: aws
+        autoSync: false
+        # Optional: pin production to a tag or a commit instead of following
+        # appsTargetRevision. Empty means "the same revision staging tracks",
+        # and then a promotion is the act of syncing rather than of moving a
+        # pointer.
+        targetRevision: ""
+
+  # The Azure-only example: a database application authenticating with the
+  # tenant's managed identity. It is deployed to the hub and nowhere else, and
+  # only when "sql" above is filled in — its database is an Azure resource and
+  # its identity is an Entra one, so it has no production stage on AWS to be
+  # promoted to.
+  dbHello:
+    enabled: true
+    # Chart path inside the applications' repository.
+    path: apps/db-hello/chart
+    # Host label: "azure-db-hello.<domain>".
+    hostPrefix: db-hello
+    hub:
+      cloud: azure
+      cluster: in-cluster

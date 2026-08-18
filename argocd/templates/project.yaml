@@ -1,0 +1,51 @@
+# The AppProject every platform application belongs to. Argo CD's "default"
+# project allows any repository, any cluster and any namespace, which is the
+# gap docs/argocd.md lists under "Known gaps"; this closes it for everything
+# the root Application brings in.
+#
+# Three boundaries, all of them enforced by Argo CD before a manifest is
+# applied:
+#
+#   sourceRepos               only the platform's two repositories may be synced
+#   destinations              only the tenant namespace, on any registered cluster
+#   clusterResourceWhitelist  empty: nothing cluster-scoped, ever
+#
+# The last one is the mechanism behind the convention that tenant onboarding
+# (namespaces, quotas, SecretStores) stays in Terraform and only workloads
+# belong in GitOps: an Application that tried to manage a Namespace would be
+# refused here rather than quietly fighting the tenants stack over it.
+#
+# It says nothing about *when* an Application is applied — that is the stage's
+# sync policy (applicationset-hello.yaml), not the project's business.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {{ .Values.project.name }}
+  namespace: {{ .Values.argocdNamespace }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    onek8s.io/environment: {{ .Values.environment | quote }}
+spec:
+  description: >-
+    OneK8s platform applications ({{ .Values.environment }}) — the platform's
+    own repositories only, namespaced resources only, in the
+    {{ .Values.tenant }} namespace.
+  # Two entries, because the delivery plane and the applications live in
+  # separate repositories: this chart comes from the first, every application
+  # chart the ApplicationSets below deploy comes from the second. Anything else
+  # is refused by Argo CD before a manifest is fetched.
+  sourceRepos:
+    - {{ .Values.repoURL | quote }}
+    - {{ .Values.appsRepoURL | quote }}
+  # Two entries because an Application may address its cluster either way: the
+  # ApplicationSet below uses destination.name (the name Argo CD knows the
+  # cluster by), while a hand-written Application usually names the server URL.
+  destinations:
+    - server: "*"
+      namespace: {{ .Values.tenant | quote }}
+    - name: "*"
+      namespace: {{ .Values.tenant | quote }}
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

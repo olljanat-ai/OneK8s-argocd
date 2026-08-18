@@ -1,0 +1,98 @@
+name: PR Validation
+
+# This repository is Helm, not Terraform: everything in argocd/ is rendered by
+# Argo CD's root Application on the hub. A template error would otherwise only
+# surface as a failed sync after the merge, so the chart is rendered here — and
+# the one property the whole design rests on, that production is never
+# auto-synced, is asserted against the rendered output rather than trusted to a
+# reviewer noticing.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chart:
+    name: helm (lint + render)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      # Rendered twice, because the second render produces an object the first
+      # one does not: without a database in the Azure foundation's outputs the
+      # db-hello ApplicationSet is deliberately absent, so only the SQL run
+      # exercises that template.
+      - name: Argo CD configuration
+        run: |
+          helm lint argocd
+          helm template platform-gitops argocd > /dev/null
+          helm template platform-gitops argocd \
+            --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
+            --set sql.database=appdb > /dev/null
+
+  gate:
+    name: the production gate holds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      # The promise this repository makes is that nothing reaches the AWS
+      # production cluster without a human. In Argo CD that is the absence of
+      # syncPolicy.automated on the production Application — a single block
+      # somebody could add back "to make it consistent". This check compares
+      # every stage's autoSync value in values.yaml with what actually renders,
+      # so the two cannot drift apart silently.
+      - name: Every stage syncs the way values.yaml says it does
+        run: |
+          helm template platform-gitops argocd \
+            --show-only templates/applicationset-hello.yaml > /tmp/hello.yaml
+          python3 - <<'PY'
+          import sys, yaml
+
+          values = yaml.safe_load(open("argocd/values.yaml"))
+          stages = values["apps"]["hello"]["stages"]
+          rendered = {
+              doc["metadata"]["name"]: doc
+              for doc in yaml.safe_load_all(open("/tmp/hello.yaml"))
+              if doc and doc.get("kind") == "ApplicationSet"
+          }
+
+          status = 0
+          for stage, cfg in stages.items():
+              name = f"hello-{stage}"
+              appset = rendered.get(name)
+              if appset is None:
+                  print(f"::error file=argocd/templates/applicationset-hello.yaml::"
+                        f"stage {stage} renders no ApplicationSet {name}")
+                  status = 1
+                  continue
+              automated = "automated" in appset["spec"]["template"]["spec"]["syncPolicy"]
+              wanted = bool(cfg.get("autoSync"))
+              print(f"{name:20} autoSync={wanted!s:5} automated={automated!s:5} "
+                    f"cloud={cfg.get('cloud')}")
+              if automated != wanted:
+                  where = "carries" if automated else "is missing"
+                  print(f"::error file=argocd/templates/applicationset-hello.yaml::"
+                        f"{name} {where} syncPolicy.automated, but values.yaml says "
+                        f"autoSync={wanted}. A stage with autoSync=false must stay "
+                        f"manual: that is the approval gate in front of production.")
+                  status = 1
+
+          if not any(cfg.get("autoSync") is False for cfg in stages.values()):
+              print("::error file=argocd/values.yaml::No stage requires manual "
+                    "promotion any more. At least one — production on AWS — must.")
+              status = 1
+
+          sys.exit(status)
+          PY
+

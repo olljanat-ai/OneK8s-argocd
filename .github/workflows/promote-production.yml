@@ -1,0 +1,136 @@
+name: Promote to production
+
+# The approval gate in front of AWS, with a record of who opened it.
+#
+# The gate itself is in the chart, not here: the production stage's Application
+# carries no syncPolicy.automated (argocd/values.yaml, apps.hello.stages), so
+# Argo CD tracks it, shows it OutOfSync the moment staging moves ahead, and
+# applies nothing until a human syncs it. That is true whether or not this
+# workflow is ever run — deleting it would not open the gate.
+#
+# What this adds is the paperwork. The job that syncs binds to the GitHub
+# environment "production", so with **required reviewers** configured on it
+# (Settings → Environments → production) the run waits for a named human to
+# approve, and the approval, the diff they approved and the sync land in the
+# same run log.
+#
+#   plan     what would change on AWS — no credentials beyond read
+#   promote  waits for approval, then syncs and waits for the app to be healthy
+#
+# Requires an Argo CD API account token:
+#   vars.ARGOCD_SERVER       e.g. argocd.onek8s.lol
+#   secrets.ARGOCD_AUTH_TOKEN  `argocd account generate-token --account ci`
+on:
+  workflow_dispatch:
+    inputs:
+      application:
+        description: "Argo CD application to promote"
+        required: true
+        default: "hello-production"
+        type: choice
+        options: [hello-production]
+      prune:
+        description: "Delete resources the chart no longer defines"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # One promotion of an application at a time; never cancel a running sync.
+  group: promote-${{ inputs.application }}
+  cancel-in-progress: false
+
+env:
+  ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER }}
+  ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+  # TLS terminates at Traefik and the CLI speaks gRPC over the same host, so
+  # gRPC-Web is what works through the ingress (see docs/argocd.md in OneK8s).
+  ARGOCD_OPTS: --grpc-web
+
+jobs:
+  plan:
+    name: what would change
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install the Argo CD CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd version --client --short
+
+      - name: The application as it stands
+        run: |
+          set -euo pipefail
+          argocd app get "${{ inputs.application }}" -o wide | tee /tmp/app.txt
+
+      # `argocd app diff` exits 1 when there is a difference, which is the
+      # normal case here — a promotion with nothing to promote is the one that
+      # would be surprising.
+      - name: Diff against the cluster
+        run: |
+          set -o pipefail
+          argocd app diff "${{ inputs.application }}" | tee /tmp/diff.txt || true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.application }} — pending promotion"
+            echo
+            echo '```'
+            cat /tmp/app.txt 2>/dev/null || echo "(the application could not be read)"
+            echo '```'
+            echo
+            echo "#### Diff"
+            echo
+            echo '```diff'
+            if [ -s /tmp/diff.txt ]; then cat /tmp/diff.txt; else echo "(no differences)"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: sync ${{ inputs.application }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # The approval. Everything above this line is read-only; nothing reaches
+    # the AWS cluster until a reviewer of this environment lets the job start.
+    environment: production
+    steps:
+      - name: Install the Argo CD CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Sync
+        run: |
+          set -euo pipefail
+          argocd app sync "${{ inputs.application }}" \
+            ${{ inputs.prune && '--prune' || '' }} \
+            --timeout 600
+
+      # A green sync is "the manifests were applied", not "the application
+      # works". This waits for the rollout the sync started.
+      - name: Wait for it to become healthy
+        run: |
+          set -euo pipefail
+          argocd app wait "${{ inputs.application }}" --health --timeout 600
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.application }} promoted"
+            echo
+            echo "Approved by @${{ github.actor }} in environment \`production\`."
+            echo
+            echo '```'
+            argocd app get "${{ inputs.application }}" -o wide || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

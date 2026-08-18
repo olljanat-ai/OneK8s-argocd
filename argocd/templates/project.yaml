@@ -31,15 +31,21 @@ spec:
     OneK8s platform applications ({{ .Values.environment }}) — the platform's
     own repositories only, namespaced resources only, in the
     {{ .Values.tenant }} namespace.
-  # Two entries, because the delivery plane and the applications live in
-  # separate repositories: this chart comes from the first, every application
-  # chart the ApplicationSets below deploy comes from the second. Anything else
-  # is refused by Argo CD before a manifest is fetched.
+  # This repository, plus every repository any application's chart comes from —
+  # computed from apps.<name>.repoURL rather than listed, so onboarding a team
+  # with its own applications repository cannot be half-done. Anything not in
+  # this list is refused by Argo CD before a manifest is fetched.
   sourceRepos:
     - {{ .Values.repoURL | quote }}
-    - {{ .Values.appsRepoURL | quote }}
+    {{- $repos := list .Values.appsRepoURL }}
+    {{- range $name, $app := .Values.apps }}
+    {{- $repos = append $repos (default $.Values.appsRepoURL $app.repoURL) }}
+    {{- end }}
+    {{- range $repos | uniq | sortAlpha }}
+    - {{ . | quote }}
+    {{- end }}
   # Two entries because an Application may address its cluster either way: the
-  # ApplicationSet below uses destination.name (the name Argo CD knows the
+  # ApplicationSets use destination.name (the name Argo CD knows the
   # cluster by), while a hand-written Application usually names the server URL.
   destinations:
     - server: "*"

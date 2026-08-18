@@ -1,0 +1,155 @@
+{{- $root := . }}
+# "Deploy every application to every cluster its stages name", as one
+# ApplicationSet per application-stage.
+#
+# One per stage rather than one per application, because stages differ in the
+# two fields that must not be got wrong: how the cluster is found, and — for an
+# application with a release path — which Kargo Stage is authorized to sync it.
+#
+# For an application WITH a release path (hello), each Application is pinned by
+# "stages/<app>/<stage>.yaml", the file Kargo writes when that stage is
+# promoted:
+#
+#   chartRevision   the generator's git files source, used as the chart
+#                   source's targetRevision — a chart change is promoted, not
+#                   inherited
+#   image.tag       a Helm values file on that source, so a new build is a value
+#                   change on an otherwise identical Application
+#
+# For an application WITHOUT one (db-hello: a single cluster, so no path to
+# travel), the chart source simply tracks appsTargetRevision.
+#
+# Note that this half does not depend on Kargo being installed. The stage files
+# are committed, so a hub with kargo.enabled = false still deploys the last
+# thing that was promoted — losing the promotion engine costs you promotions,
+# not the deployment.
+#
+# Every Application is auto-synced either way, and that is the point: with Kargo
+# in front, what a cluster runs is decided before Argo CD ever sees it. The gate
+# is the absence of a commit — "stages/hello/production.yaml" still names the
+# previous build — rather than the absence of a sync policy, so it cannot be
+# lifted by editing this file, it is visible in `git log`, and it names whoever
+# opened it.
+#
+# NOTE ON BRACES: Helm and Argo CD both use Go templates, and this file is
+# rendered by both. Anything wrapped in a backtick-quoted Helm literal comes
+# through untouched and is evaluated later by the ApplicationSet controller;
+# everything else is substituted by Helm at sync time from values.yaml.
+{{- range $name, $app := .Values.apps }}
+{{- if include "onek8s.appEnabled" (dict "root" $root "app" $app) }}
+{{- $promoted := include "onek8s.hasRelease" (dict "root" $root "app" $app) }}
+{{- $kargoManaged := include "onek8s.kargoManaged" (dict "root" $root "app" $app) }}
+{{- $appsRepoURL := include "onek8s.appsRepoURL" (dict "root" $root "app" $app) }}
+{{- range $stage, $cfg := $app.stages }}
+{{- $stageFile := include "onek8s.stageFile" (dict "root" $root "name" $name "stage" $stage) }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: {{ printf "%s-%s" $name $stage }}
+  namespace: {{ $root.Values.argocdNamespace }}
+  labels:
+    app.kubernetes.io/part-of: onek8s
+    app.kubernetes.io/name: {{ $name }}
+    onek8s.io/environment: {{ $root.Values.environment | quote }}
+    onek8s.io/stage: {{ $stage | quote }}
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  generators:
+    {{- if $promoted }}
+    # A matrix of "what this stage runs" and "where it runs". Both halves are
+    # single-valued, so it produces one Application — or none, when the cloud
+    # this stage names is not a registered spoke in this environment.
+    - matrix:
+        generators:
+          # What: the file Kargo writes when this stage is promoted. Reading it
+          # here rather than hard-coding a revision is what makes a promotion
+          # take effect.
+          - git:
+              repoURL: {{ $root.Values.repoURL | quote }}
+              revision: {{ $root.Values.targetRevision | quote }}
+              files:
+                - path: {{ $stageFile | quote }}
+
+          # Where.
+          {{- include "onek8s.clusterGenerator" (dict "root" $root "cfg" $cfg) | nindent 10 }}
+    {{- else }}
+    {{- include "onek8s.clusterGenerator" (dict "root" $root "cfg" $cfg) | nindent 4 }}
+    {{- end }}
+
+  template:
+    metadata:
+      name: {{ printf "%s-%s" $name $stage }}
+      {{- if $kargoManaged }}
+      annotations:
+        # Kargo's argocd-update step refuses to touch an Application that has
+        # not named the Stage acting on it. One entry, so a stage cannot sync
+        # another stage's cluster — or another application's.
+        kargo.akuity.io/authorized-stage: {{ printf "%s:%s" (include "onek8s.kargoProject" (dict "root" $root "name" $name)) $stage | quote }}
+      {{- end }}
+      labels:
+        app.kubernetes.io/part-of: onek8s
+        app.kubernetes.io/name: {{ $name }}
+        onek8s.io/cloud: {{ $cfg.cloud | quote }}
+        onek8s.io/environment: {{ $root.Values.environment | quote }}
+        onek8s.io/stage: {{ $stage | quote }}
+    spec:
+      project: {{ $root.Values.project.name }}
+      sources:
+        # The application's chart: this chart says where an application is
+        # deployed, the application's own repository says what it is.
+        - repoURL: {{ $appsRepoURL | quote }}
+          {{- if $promoted }}
+          targetRevision: '{{`{{ .chartRevision }}`}}'
+          {{- else }}
+          targetRevision: {{ $root.Values.appsTargetRevision | quote }}
+          {{- end }}
+          path: {{ $app.chartPath | quote }}
+          helm:
+            {{- if $promoted }}
+            # The promoted build, read straight out of the same file. A values
+            # file rather than a parameter on purpose: Argo CD then tracks this
+            # repository as a source of the Application, so a promotion shows up
+            # as an out-of-sync Application within seconds instead of waiting
+            # for the generator above to run again.
+            valueFiles:
+              - {{ printf "$values/%s" $stageFile | quote }}
+            {{- end }}
+            # Parameters rather than a values block: they are plain strings, so
+            # the substitutions are unambiguous, and they override the chart's
+            # own values.yaml without duplicating it.
+            parameters:
+              {{- include "onek8s.helmParameters" (dict "root" $root "app" $app "name" $name "stage" $stage "cloud" $cfg.cloud) | nindent 14 }}
+        {{- if $promoted }}
+
+        # This repository, as a values reference only — no path, nothing
+        # rendered from it. It exists so that "$values" above resolves.
+        - repoURL: {{ $root.Values.repoURL | quote }}
+          targetRevision: {{ $root.Values.targetRevision | quote }}
+          ref: values
+        {{- end }}
+      destination:
+        # By name, not by server URL: a spoke's API endpoint is whatever EKS
+        # happened to hand out, and Argo CD already knows it from the cluster
+        # Secret the gitops stack wrote.
+        name: '{{`{{ .values.cluster }}`}}'
+        namespace: {{ $root.Values.tenant | quote }}
+      syncPolicy:
+        # Automated everywhere. Kargo decides what each stage runs; Argo CD only
+        # makes the cluster match it, and should do so without waiting to be
+        # asked — including when somebody edits a live object by hand (selfHeal)
+        # or a promotion removes one (prune).
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          # The namespace belongs to the tenants stack. If it is missing, the
+          # sync should fail loudly rather than have Argo CD create a namespace
+          # with none of the tenant's quota, network policy or SecretStore.
+          - CreateNamespace=false
+      revisionHistoryLimit: 3
+{{- end }}
+{{- end }}
+{{- end }}

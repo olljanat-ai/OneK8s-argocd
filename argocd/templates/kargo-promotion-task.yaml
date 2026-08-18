@@ -1,0 +1,131 @@
+{{- $root := . }}
+{{- $promoted := dict }}
+{{- range $name, $app := .Values.apps }}
+{{- if and (include "onek8s.appEnabled" (dict "root" $root "app" $app)) (include "onek8s.kargoManaged" (dict "root" $root "app" $app)) }}
+{{- $_ := set $promoted $name $app }}
+{{- end }}
+{{- end }}
+{{- if $promoted }}
+# How this platform promotes anything. One object, cluster-scoped, referenced by
+# every Stage of every application.
+#
+# This is the piece that decides whether the delivery plane survives its tenth
+# application. The five steps below are identical for every application and
+# every stage — only the repository, the file and the Argo CD Application differ
+# — so they are a ClusterPromotionTask with variables rather than a
+# promotionTemplate copied per Stage. Fifty applications share one copy of
+# "clone, write the tag, commit, push, sync", and a fix to the procedure is one
+# commit rather than fifty.
+#
+# What a Stage still owns is the part that is genuinely its own: which Freight it
+# may take, from where, and whether a person has to ask (kargo-stages.yaml).
+#
+# Cluster-scoped, so it is brought in by the root Application rather than by any
+# one Project — the same reason the Kargo Projects are.
+#
+# NOTE ON BRACES: Helm and Kargo both spell an expression with braces, and this
+# file is read by both. A Kargo expression is wrapped in a backtick-quoted Helm
+# literal so that Helm passes it through untouched and the promotion engine
+# evaluates it later.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: {{ .Values.kargo.promotionTask | quote }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+    kargo.akuity.io/description: >-
+      Write the promoted image tag and chart revision into the delivery-plane
+      repository, then let Argo CD apply it.
+  labels:
+    app.kubernetes.io/part-of: onek8s
+spec:
+  # Every variable is required and comes from the Stage's promotionTemplate,
+  # which inherits them to the task. No defaults: a task that guessed a
+  # repository or a branch would be a task that promoted the wrong thing
+  # quietly.
+  vars:
+    - name: app
+    - name: stage
+    - name: repoURL
+    - name: branch
+    - name: stageFile
+    - name: appsRepoURL
+    - name: imageRepoURL
+    - name: argocdApp
+    - name: argocdNamespace
+    - name: authorName
+    - name: authorEmail
+
+  steps:
+    # 1. The delivery-plane repository. Kargo needs a credential that may push
+    #    to it: a Secret labelled kargo.akuity.io/cred-type=git, in the
+    #    Project's namespace or in the cluster's shared-credentials namespace
+    #    (see the README). It is the one credential this design has, and it can
+    #    do exactly one thing — write to a Git repository.
+    - uses: git-clone
+      as: clone
+      config:
+        repoURL: {{`${{ vars.repoURL }}`}}
+        author:
+          name: {{`${{ vars.authorName }}`}}
+          email: {{`${{ vars.authorEmail }}`}}
+        checkout:
+          - branch: {{`${{ vars.branch }}`}}
+            path: ./repo
+
+    # 2. Write down what this stage runs. Two lines in one small file, and they
+    #    are the whole of the promotion: everything else — which cluster, which
+    #    host, which secret — belongs to the stage rather than to the release,
+    #    and is rendered by the ApplicationSet.
+    - uses: yaml-update
+      as: update
+      config:
+        path: {{`${{ "./repo/" + vars.stageFile }}`}}
+        updates:
+          - key: image.tag
+            value: {{`${{ imageFrom(vars.imageRepoURL).Tag }}`}}
+          - key: chartRevision
+            value: {{`${{ commitFrom(vars.appsRepoURL).ID }}`}}
+
+    # 3. The record. A promotion nobody can find afterwards is not much of an
+    #    audit trail, so the message carries the Freight, both artifacts and —
+    #    for a promotion somebody asked for — their name.
+    - uses: git-commit
+      as: commit
+      config:
+        path: ./repo
+        message: |-
+          {{`${{ vars.app }}`}}/{{`${{ vars.stage }}`}}: promote {{`${{ imageFrom(vars.imageRepoURL).Tag }}`}}
+
+          Freight:   {{`${{ ctx.targetFreight.name }}`}}
+          Chart:     {{`${{ commitFrom(vars.appsRepoURL).ID }}`}}
+          Promotion: {{`${{ ctx.promotion }}`}}
+          Requested: {{`${{ ctx.meta.promotion.actor == '' ? 'kargo (auto-promotion)' : ctx.meta.promotion.actor }}`}}
+
+    - uses: git-push
+      as: push
+      config:
+        path: ./repo
+        targetBranch: {{`${{ vars.branch }}`}}
+
+    # 4. Argo CD does the applying, as it always did. This asks it to look now
+    #    rather than on its next refresh, and waits until the Application is
+    #    synced at both of the revisions this promotion fixed — the chart's, and
+    #    the commit just pushed — and healthy. Without that wait, a promotion
+    #    would report success while the old pods were still serving.
+    #
+    #    task.outputs, not outputs: a task's step aliases are namespaced when
+    #    Kargo inflates the task into a Promotion, so this is the only way to
+    #    reach the commit the push produced.
+    - uses: argocd-update
+      as: sync
+      config:
+        apps:
+          - name: {{`${{ vars.argocdApp }}`}}
+            namespace: {{`${{ vars.argocdNamespace }}`}}
+            sources:
+              - repoURL: {{`${{ vars.appsRepoURL }}`}}
+                desiredRevision: {{`${{ commitFrom(vars.appsRepoURL).ID }}`}}
+              - repoURL: {{`${{ vars.repoURL }}`}}
+                desiredRevision: {{`${{ task.outputs['push'].commit }}`}}
+{{- end }}

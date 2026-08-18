@@ -5,8 +5,10 @@ description: >-
   ApplicationSets Argo CD syncs, and the Kargo Project, Warehouse and Stages
   that decide what each of those Applications runs — Azure for staging, AWS for
   production, with the gate in front of the latter being a promotion nobody has
-  made rather than a sync nobody has pressed. The root Application that OneK8s'
-  gitops/root-app.tf creates is the only piece of this that Terraform owns; from
-  here down the delivery plane is Git.
+  made rather than a sync nobody has pressed. No template here names an
+  application: they range over values.yaml's "apps", and one cluster-scoped
+  PromotionTask defines how every one of them is promoted. The root Application
+  that OneK8s' gitops/root-app.tf creates is the only piece of this that
+  Terraform owns; from here down the delivery plane is Git.
 type: application
-version: 0.3.0
+version: 0.4.0

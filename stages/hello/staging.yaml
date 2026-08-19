@@ -15,6 +15,6 @@
 # required") until the first promotion has run, which is the honest state — an
 # environment whose Warehouse has not produced Freight yet has nothing to
 # deploy.
-chartRevision: main
+chartRevision: 7eac6f6bb0d251981903b6d7114744285d35f6ae
 image:
-  tag: ""
+  tag: sha-0153ef4

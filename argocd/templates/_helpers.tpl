@@ -62,6 +62,21 @@ hub without Kargo renders Argo CD objects and no promotion objects.
 {{- if and .root.Values.kargo.enabled .app.release -}}true{{- end -}}
 {{- end -}}
 
+{{/*
+Is this stage's cluster reached through an argocd-agent agent?
+
+It follows from the topology rather than from a per-stage switch, and from the
+same fact the cluster generator reads: a stage that names a "cluster" is the hub
+(there is exactly one, "in-cluster", and the hub is the principal, not an
+agent), while a stage that names only a "cloud" is a spoke — and every spoke is
+attached by an agent now.
+
+Returns "true" or "".
+*/}}
+{{- define "onek8s.agentManaged" -}}
+{{- if and .root.Values.agent.enabled (not .cfg.cluster) -}}true{{- end -}}
+{{- end -}}
+
 {{/* The Kargo Project (and its namespace) of one application. */}}
 {{- define "onek8s.kargoProject" -}}
 {{- printf "%s-%s" .root.Values.kargo.projectPrefix .name -}}

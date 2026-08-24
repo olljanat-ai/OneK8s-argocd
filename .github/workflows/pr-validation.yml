@@ -79,6 +79,106 @@ jobs:
           sys.exit(status)
           PY
 
+      # Which side of the argocd-agent boundary each object lands on. Getting
+      # it wrong is silent in both directions and neither shows up in a render:
+      #
+      #   a spoke Application WITHOUT the label   the principal never sees it,
+      #                                           so nothing routes it to the
+      #                                           agent and the hub tries to
+      #                                           apply it to what is actually
+      #                                           the principal's resource proxy
+      #   a hub Application WITH the label        the principal routes it to an
+      #                                           agent that does not exist,
+      #                                           while the hub's controller
+      #                                           also reconciles it
+      #   an unlabelled AppProject                distributed to no agent, so
+      #                                           every Application on every
+      #                                           spoke names a project its
+      #                                           cluster has never heard of
+      #
+      # The rule is not a per-stage setting and must not become one: a stage
+      # that names a fixed cluster is the hub, a stage that names only a cloud
+      # is a spoke, and every spoke is an agent.
+      - name: The agent label follows the topology
+        run: |
+          helm template platform-gitops argocd --set agent.enabled=true \
+            --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
+            --set sql.database=appdb > /tmp/agent-on.yaml
+          helm template platform-gitops argocd \
+            --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
+            --set sql.database=appdb > /tmp/agent-off.yaml
+          python3 - <<'PY'
+          import sys, yaml
+
+          values = yaml.safe_load(open("argocd/values.yaml"))
+          label = values["agent"]["label"]
+          status = 0
+
+          def error(where, message):
+              global status
+              print(f"::error file={where}::{message}")
+              status = 1
+
+          # Which stages are on a spoke, straight out of values.yaml.
+          spoke_stages = {
+              f"{app}-{stage}"
+              for app, cfg in values["apps"].items() if cfg.get("enabled")
+              for stage, s in cfg["stages"].items() if not s.get("cluster")
+          }
+          if not spoke_stages:
+              error("argocd/values.yaml", "No stage deploys to a spoke any more, so the "
+                                          "agent path is not exercised at all.")
+
+          on = [d for d in yaml.safe_load_all(open("/tmp/agent-on.yaml")) if d]
+          off = [d for d in yaml.safe_load_all(open("/tmp/agent-off.yaml")) if d]
+
+          for doc in on:
+              if doc["kind"] != "ApplicationSet":
+                  continue
+              name = doc["metadata"]["name"]
+              template = doc["spec"]["template"]
+              labelled = template["metadata"].get("labels", {}).get(label) == "true"
+              if name in spoke_stages and not labelled:
+                  error("argocd/templates/applicationsets.yaml",
+                        f"{name} deploys to a spoke but its Applications carry no {label!r}. "
+                        "The principal only routes labelled Applications, so this stage "
+                        "would never reach its agent.")
+              if name not in spoke_stages and labelled:
+                  error("argocd/templates/applicationsets.yaml",
+                        f"{name} deploys to the hub but its Applications carry {label!r}. "
+                        "The hub is the principal, not an agent: labelling it means the "
+                        "principal routes it nowhere while the hub reconciles it anyway.")
+              # The routing key itself.
+              if "name" not in template["spec"]["destination"]:
+                  error("argocd/templates/applicationsets.yaml",
+                        f"{name} addresses its cluster by server URL. Destination-based "
+                        "mapping routes on spec.destination.name; without it the principal "
+                        "cannot tell which agent the Application belongs to.")
+
+          project = next(d for d in on if d["kind"] == "AppProject")
+          if project["metadata"].get("labels", {}).get(label) != "true":
+              error("argocd/templates/project.yaml",
+                    f"the AppProject carries no {label!r}, so the principal never "
+                    "distributes it. Every Application on every spoke would name a project "
+                    "its own Argo CD has never heard of.")
+          if not any(d.get("name") == "*" for d in project["spec"]["destinations"]):
+              error("argocd/templates/project.yaml",
+                    "the AppProject has no 'name: \"*\"' destination. The principal matches "
+                    "agent names against these entries to decide who gets the project.")
+
+          # And a hub with no principal (OneK8s' enable_argocd_agent = false) must
+          # label nothing at all, rather than labelling for agents that do not exist.
+          for doc in off:
+              labels = doc["metadata"].get("labels", {}) or {}
+              nested = (doc.get("spec", {}).get("template", {}) or {}).get("metadata", {}).get("labels", {}) or {}
+              if label in labels or label in nested:
+                  error("argocd/values.yaml",
+                        f"{doc['kind']} {doc['metadata']['name']} is labelled {label!r} with "
+                        "agent.enabled=false. A hub without a principal has no agents.")
+
+          sys.exit(status)
+          PY
+
       # A hub without Kargo is a supported state (OneK8s' enable_kargo = false),
       # and it must render Argo CD objects and no promotion objects rather than
       # failing.

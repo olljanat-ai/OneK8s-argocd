@@ -26,6 +26,18 @@ metadata:
   labels:
     app.kubernetes.io/part-of: onek8s
     onek8s.io/environment: {{ .Values.environment | quote }}
+    {{- if .Values.agent.enabled }}
+    # The AppProject has to reach the agents too, not just the Applications.
+    # A spoke's Argo CD validates every Application it is handed against the
+    # project it names, and an unlabelled AppProject is invisible to the
+    # principal — so it would never be distributed, and every Application on
+    # every spoke would sit in "Unknown" reporting a project that does not
+    # exist there.
+    #
+    # It is distributed to an agent whose name matches one of .spec.destinations
+    # below, which the "name: *" entry covers.
+    {{ .Values.agent.label }}: "true"
+    {{- end }}
 spec:
   description: >-
     OneK8s platform applications ({{ .Values.environment }}) — the platform's
@@ -47,6 +59,12 @@ spec:
   # Two entries because an Application may address its cluster either way: the
   # ApplicationSets use destination.name (the name Argo CD knows the
   # cluster by), while a hand-written Application usually names the server URL.
+  #
+  # The "name" entry carries a second job under argocd-agent: the principal
+  # decides which agents an AppProject is distributed to by matching their names
+  # against these entries as globs. "*" means every agent gets it, which is what
+  # a platform-wide project wants — narrow it and a spoke left out has
+  # Applications it cannot validate.
   destinations:
     - server: "*"
       namespace: {{ .Values.tenant | quote }}

@@ -126,6 +126,27 @@ cluster Secret and therefore no labels to select on, so it is named
 gitops stack put on the Secret it wrote — and a stage whose cloud is not
 registered as a spoke in this environment generates nothing at all: there is no
 cluster to deploy to, and nothing to keep in sync between the two.
+
+Both halves produce the same parameter, "name", which is what the cluster
+generator calls a cluster and what the Application's destination is written
+from. The list spells it out by hand so that one destination expression serves
+a named cluster and a selected one alike.
+
+NEITHER GENERATOR MAY CONTAIN A TEMPLATE, and that is not a style preference.
+For a stage with a release path this generator is the second half of a matrix,
+and a matrix renders each subsequent generator with the parameters of the ones
+before it *before* running it. A "{{`{{ .name }}`}}" here — the usual way to
+carry a cluster generator's name through its "values" block — is therefore
+resolved against the git generator's parameters, which have no such key, and
+with goTemplateOptions: [missingkey=error] the whole ApplicationSet fails:
+
+  failed to get params for second generator in the matrix generator: ...
+  map has no entry for key "name"
+
+The stage then has no Application at all, which surfaces at the far end of the
+release path as Kargo's argocd-update step reporting that it is "unable to find
+Argo CD Application <app>-<stage>". Keep the cluster name in the Application
+template, where the merged parameters of both generators are in scope.
 */}}
 {{- define "onek8s.clusterGenerator" -}}
 {{- $root := .root -}}
@@ -133,17 +154,13 @@ cluster to deploy to, and nothing to keep in sync between the two.
 {{- if $cfg.cluster }}
 - list:
     elements:
-      - values:
-          cloud: {{ $cfg.cloud | quote }}
-          cluster: {{ $cfg.cluster | quote }}
+      - name: {{ $cfg.cluster | quote }}
+        cloud: {{ $cfg.cloud | quote }}
 {{- else }}
 - clusters:
     selector:
       matchLabels:
         onek8s.io/environment: {{ $root.Values.environment | quote }}
         onek8s.io/cloud: {{ $cfg.cloud | quote }}
-    values:
-      cloud: {{ $cfg.cloud | quote }}
-      cluster: '{{`{{ .name }}`}}'
 {{- end }}
 {{- end -}}

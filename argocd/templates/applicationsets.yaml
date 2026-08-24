@@ -134,7 +134,12 @@ spec:
         # By name, not by server URL: a spoke's API endpoint is whatever EKS
         # happened to hand out, and Argo CD already knows it from the cluster
         # Secret the gitops stack wrote.
-        name: '{{`{{ .values.cluster }}`}}'
+        #
+        # Read here rather than carried through the generator's "values": in the
+        # matrix above, the cluster generator's own fields are rendered with the
+        # git generator's parameters before it runs, so a template there resolves
+        # against the wrong half — see onek8s.clusterGenerator.
+        name: '{{`{{ .name }}`}}'
         namespace: {{ $root.Values.tenant | quote }}
       syncPolicy:
         # Automated everywhere. Kargo decides what each stage runs; Argo CD only

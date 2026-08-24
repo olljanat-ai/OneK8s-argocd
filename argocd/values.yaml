@@ -62,6 +62,37 @@ project:
   name: onek8s-platform
 
 # -----------------------------------------------------------------------------
+# argocd-agent: how a stage that runs on a spoke actually gets there.
+#
+# The hub is the only cluster with an Argo CD anybody signs in to, and it is the
+# only place an Application is created — that has not changed. What changed is
+# the last hop. Argo CD used to hold a cluster-admin token for each spoke and
+# apply manifests to it over its public Kubernetes API; now each spoke runs an
+# argocd-agent agent that dials the hub outwards, and the principal on the hub
+# routes each Application to the agent named by its spec.destination.name. The
+# spoke's own Argo CD does the applying.
+#
+# For this chart that is one label and nothing else. Everything below it —
+# generators, destinations, Kargo, the stage files — is unchanged, because an
+# ApplicationSet already addresses a cluster by the name Argo CD knows it by,
+# and that name is the agent's name.
+#
+# The label is what keeps the two halves apart. The hub runs a full Argo CD (it
+# is a deployment target too: hello's staging stage and db-hello both run
+# there), so the principal and every agent only look at objects carrying this
+# label, and the hub's own application-controller keeps everything else. An
+# Application for a spoke MUST have it or it is never routed; an Application for
+# the hub must NOT, or two controllers reconcile it.
+#
+# Both values are set by Terraform from the hub's outputs (OneK8s'
+# gitops/root-app.tf). enabled is false for a hub applied with
+# enable_argocd_agent = false, and then nothing here is labelled — which is
+# correct, because such a hub has no agents.
+agent:
+  enabled: false
+  label: onek8s.io/agent-managed
+
+# -----------------------------------------------------------------------------
 # Kargo: the promotion engine in front of Argo CD.
 #
 # Argo CD answers "is the cluster what Git says it is" and has no opinion about

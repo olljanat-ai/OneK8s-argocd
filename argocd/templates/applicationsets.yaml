@@ -19,6 +19,14 @@
 # For an application WITHOUT one (db-hello: a single cluster, so no path to
 # travel), the chart source simply tracks appsTargetRevision.
 #
+# WHERE THESE APPLICATIONS RUN. Every Application here is created on the hub,
+# and that is where the resemblance to the old arrangement ends for a stage on a
+# spoke: it is labelled for argocd-agent, the principal routes it to that
+# cluster's agent, and the copy the agent makes locally is reconciled by the
+# spoke's own application-controller. Nothing on the hub calls the spoke's
+# Kubernetes API any more. A stage on the hub is unlabelled and is applied by
+# the hub's controller exactly as before.
+#
 # Note that this half does not depend on Kargo being installed. The stage files
 # are committed, so a hub with kargo.enabled = false still deploys the last
 # thing that was promoted — losing the promotion engine costs you promotions,
@@ -42,6 +50,7 @@
 {{- $appsRepoURL := include "onek8s.appsRepoURL" (dict "root" $root "app" $app) }}
 {{- range $stage, $cfg := $app.stages }}
 {{- $stageFile := include "onek8s.stageFile" (dict "root" $root "name" $name "stage" $stage) }}
+{{- $agentManaged := include "onek8s.agentManaged" (dict "root" $root "cfg" $cfg) }}
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
@@ -95,6 +104,20 @@ spec:
         onek8s.io/cloud: {{ $cfg.cloud | quote }}
         onek8s.io/environment: {{ $root.Values.environment | quote }}
         onek8s.io/stage: {{ $stage | quote }}
+        {{- if $agentManaged }}
+        # This Application belongs to an agent. The argocd-agent principal only
+        # looks at objects carrying this label, and routes each one to the agent
+        # named by spec.destination.name below; the hub's own
+        # application-controller skips it, because the cluster Secret that spoke
+        # is registered by carries argocd.argoproj.io/skip-reconcile.
+        #
+        # Without the label nothing routes it and the hub tries to apply it
+        # itself — to a "cluster" that is the principal's resource proxy. With
+        # it on a hub stage, two controllers reconcile one Application. Which
+        # side a stage is on is not configured here: it follows from whether the
+        # stage names a fixed cluster (the hub) or a cloud (a spoke).
+        {{ $root.Values.agent.label }}: "true"
+        {{- end }}
     spec:
       project: {{ $root.Values.project.name }}
       sources:
@@ -131,9 +154,13 @@ spec:
           ref: values
         {{- end }}
       destination:
-        # By name, not by server URL: a spoke's API endpoint is whatever EKS
-        # happened to hand out, and Argo CD already knows it from the cluster
-        # Secret the gitops stack wrote.
+        # By name, not by server URL — and now for a second reason on top of the
+        # first. It was always the stable way to address a spoke, since its API
+        # endpoint is whatever EKS happened to hand out; with argocd-agent it is
+        # also the routing key. The principal reads this field to decide which
+        # agent an Application belongs to (destination-based mapping), and the
+        # name it looks for is the agent's, which is the name the gitops stack
+        # gave the spoke.
         #
         # Read here rather than carried through the generator's "values": in the
         # matrix above, the cluster generator's own fields are rendered with the

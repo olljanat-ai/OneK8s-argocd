@@ -39,6 +39,46 @@ jobs:
             --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
             --set sql.database=appdb > /dev/null
 
+      # An ApplicationSet generator must not contain a Go template, and this is
+      # the cheapest place to say so.
+      #
+      # A matrix generator renders each of its generators with the parameters of
+      # the ones before it *before* running it, so a "{{ .name }}" inside the
+      # cluster generator — the usual way to carry a cluster's name through a
+      # "values" block — is resolved against the git generator's parameters
+      # instead of against the cluster. With goTemplateOptions: [missingkey=error]
+      # that fails the whole ApplicationSet, and the stage then has no
+      # Application at all: a silent failure at the Argo CD end that surfaces at
+      # the far end of the release path as Kargo reporting it cannot find the
+      # Application it was told to sync.
+      #
+      # Anything a generator would have carried belongs in the Application
+      # template, where both halves' parameters are in scope. The template is
+      # where the braces are expected, so only generators are checked.
+      - name: No generator carries a template
+        run: |
+          helm template platform-gitops argocd \
+            --set sql.server=sql-onek8s-prototype-ab12.database.windows.net \
+            --set sql.database=appdb > /tmp/generators.yaml
+          python3 - <<'PY'
+          import json, sys, yaml
+
+          status = 0
+          for doc in yaml.safe_load_all(open("/tmp/generators.yaml")):
+              if not doc or doc["kind"] != "ApplicationSet":
+                  continue
+              rendered = json.dumps(doc["spec"]["generators"])
+              if "{{" in rendered:
+                  print(f"::error file=argocd/templates/_helpers.tpl::ApplicationSet "
+                        f"{doc['metadata']['name']} has a Go template inside a generator: "
+                        f"{rendered}. In a matrix it is rendered with the other "
+                        "generator's parameters and fails under missingkey=error, "
+                        "leaving the stage with no Application. Move it into the "
+                        "Application template.")
+                  status = 1
+          sys.exit(status)
+          PY
+
       # A hub without Kargo is a supported state (OneK8s' enable_kargo = false),
       # and it must render Argo CD objects and no promotion objects rather than
       # failing.

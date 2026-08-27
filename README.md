@@ -7,18 +7,24 @@ Argo CD `AppProject` and `ApplicationSet`s, and the [Kargo](https://kargo.io)
 Applications runs.
 
 It holds no application source, no chart of an application and no Terraform.
-Three repositories, three jobs:
+Four repositories, four jobs:
 
 | Repository | Owns |
 |---|---|
 | [OneK8s](https://github.com/olljanat-ai/OneK8s) | The clusters and the platform: foundations, tenants, the Argo CD hub, Kargo, and the one root `Application` that points them here. |
 | **OneK8s-argocd** (this one) | Where and when an application is deployed: the `AppProject`, the `ApplicationSet`s, the release path and the gate in front of production. |
-| [OneK8s-hello](https://github.com/olljanat-ai/OneK8s-hello) | What is deployed: the example applications, their source, their Dockerfiles and their charts. |
+| [OneK8s-fluxcd](https://github.com/olljanat-ai/OneK8s-fluxcd) | The same question — where and when — answered by Flux, per cluster, with no hub and no promotion engine. It runs beside this one on AKS and EKS, deploying the same charts to a different tenant, so the two shapes can be compared while running. |
+| [OneK8s-hello](https://github.com/olljanat-ai/OneK8s-hello) | What is deployed: the example applications, their source, their Dockerfiles and their charts. **Both** delivery planes deploy these, unchanged. |
 
 The split is the point. A developer changing `apps/hello/chart` in OneK8s-hello
 never touches the delivery plane; a change to the delivery plane never rebuilds
 an image; and the platform repository owns neither — it only says which
 repository, revision and environment the delivery plane is bootstrapped from.
+
+It is also what makes the comparison with OneK8s-fluxcd honest: that plane
+deploys the same charts from the same repository, to the same clusters, and
+neither plane needed a line of the other's. Nothing here changes because it
+exists.
 
 ```
 OneK8s                     this repository                      OneK8s-hello
